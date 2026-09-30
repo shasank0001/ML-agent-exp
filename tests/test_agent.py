@@ -253,6 +253,19 @@ async def test_provider_error_is_surfaced_not_raised(settings: Settings, tmp_pat
     assert events[-1].type == "done"
 
 
+async def test_vague_request_makes_the_agent_ask(settings: Settings, tmp_path: Path, messy_csv: Path) -> None:
+    """A request with no named target must produce an ask_user round trip."""
+    llm = PolicyLLM()
+    ask = RecordingAskUser(["churned"])
+    agent = make_agent(settings, llm, tmp_path, ask_user=ask)
+    agent.add_attachment(messy_csv)
+    events = await collect(agent, "can you do some modelling for me?")
+    names = [e.data.get("name") for e in events if e.type == "tool_start"]
+    assert "ask_user" in names
+    assert ask.questions, "the UI callback should have been asked"
+    assert agent.state.task is None or agent.state.task.target == "churned"
+
+
 # -- attachments --------------------------------------------------------
 async def test_attachments_are_copied_and_announced(settings: Settings, tmp_path: Path, messy_csv: Path) -> None:
     llm = ScriptedLLM(turns=[("ok", [])])
@@ -311,7 +324,6 @@ async def test_golden_path_end_to_end(settings: Settings, tmp_path: Path, messy_
     events = await collect(agent, "build the best model to predict `churned`")
     names = [e.data.get("name") for e in events if e.type == "tool_start"]
     assert "profile_dataset" in names
-    assert "ask_user" in names
     assert "todo" in names
     assert names.count("python") >= 4
     assert events[-1].type == "done"

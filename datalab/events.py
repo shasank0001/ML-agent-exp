@@ -26,6 +26,7 @@ EventType = Literal[
     "approval_response",
     "ask_user",
     "ask_user_response",
+    "warning",
     "state_update",
     "error",
     "done",

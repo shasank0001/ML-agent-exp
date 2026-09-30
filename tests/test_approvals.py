@@ -284,6 +284,12 @@ def test_shutil_copy_outside_asks(state: ResearchState, session: Path, code: str
     assert "destructive" in request.title.lower()
 
 
+def test_harmless_dynamic_import_does_not_ask(state: ResearchState, session: Path) -> None:
+    """`__import__("sklearn...")` is a lazy import, not an escape."""
+    assert ask(state, session, "m = __import__('sklearn.ensemble', fromlist=['x'])") is None
+    assert ask(state, session, "cls = __import__(name, fromlist=[name])") is None
+
+
 def test_shutil_copy_with_bare_variables_does_not_ask(
     state: ResearchState, session: Path
 ) -> None:

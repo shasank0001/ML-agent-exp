@@ -113,6 +113,19 @@ class LabSession:
     def has_split(self) -> bool:
         """True once an encoded split is held in memory."""
         return self.X_train is not None and self.X_test is not None
+    def reset_split(self) -> None:
+        """Forget the cached split so the next `split()` call rebuilds it.
+
+        Experiments already logged keep their numbers; only the cached frames
+        and the recorded split config are cleared.
+        """
+        self.X_train = self.X_test = None
+        self.y_train = self.y_test = None
+        self._preprocess = None
+        self._feature_names = []
+        if self.state.task is not None:
+            self.state.task.split = {}
+
     @property
     def preprocess(self) -> ColumnTransformer | None:
         """The fitted column transformer (None before the first split)."""
@@ -182,16 +195,26 @@ class LabSession:
         for col in dates:  # datetimes become epoch seconds
             work[col] = (pd.to_datetime(work[col], errors="coerce", utc=True) - _EPOCH).dt.total_seconds().astype(float)
         return work
-    def split(self, df: pd.DataFrame, target: str, task_type: str | None = None, test_size: float = 0.2, seed: int = 42) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-        """Encode features and create (or reuse) the train/test split for ``target``."""
+    def split(self, df: pd.DataFrame, target: str, task_type: str | None = None,
+              test_size: float = 0.2, seed: int = 42, force: bool = False
+              ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+        """Encode features and create (or reuse) the train/test split for ``target``.
+
+        Re-splitting the same target with different features, ``test_size`` or
+        ``seed`` replaces the cached split automatically. Pass ``force=True``
+        to rebuild it even when nothing changed -- e.g. after cleaning the
+        frame in place.
+        """
         if target not in df.columns:
             raise ValueError(f"lab.split: target {target!r} not in columns")
         resolved: TaskType = task_type or infer_task_type(df[target])  # type: ignore[assignment]
         if resolved not in _TASKS:
             raise ValueError(f"unknown task_type {task_type!r}")
         cur = self.state.task
-        if (self.X_train is not None and self.y_train is not None and cur is not None and cur.target == target
-                and cur.task_type == resolved and cur.split.get("seed") == seed and cur.split.get("test_size") == test_size):
+        if (not force and self.X_train is not None and self.y_train is not None
+                and cur is not None and cur.target == target
+                and cur.task_type == resolved and cur.split.get("seed") == seed
+                and cur.split.get("test_size") == test_size):
             assert self.X_test is not None and self.y_test is not None
             return self.X_train, self.X_test, self.y_train, self.y_test
         keep = df[target].notna()  # rows with a missing target can neither train nor score
@@ -270,9 +293,23 @@ class LabSession:
                                   y_proba=y_proba, classes=getattr(model, "classes_", None))
         model_name = ("+".join(type(s).__name__ for _, s in model.steps) + "|Pipeline"
                       if isinstance(model, Pipeline) else type(model).__name__)
-        self.state.add_experiment(Experiment(id=uuid.uuid4().hex[:8], name=name, model=model_name,
-            params=dict(params or {}), metrics=metrics, primary_metric=task.primary_metric, status="done", notes=notes or ""))
+        self._log(Experiment(id=uuid.uuid4().hex[:8], name=name, model=model_name,
+            params=dict(params or {}), metrics=metrics, primary_metric=task.primary_metric,
+            status="done", notes=notes or ""))
         return dict(metrics)
+
+    def _log(self, exp: Experiment) -> None:
+        """Record an experiment, replacing an earlier run of the same name.
+
+        Re-splitting and re-running the baselines is normal, and a results table
+        that lists `baseline_logreg` twice with different numbers invites the
+        reader to compare a run against itself.
+        """
+        for i, existing in enumerate(self.state.experiments):
+            if existing.name == exp.name:
+                self.state.experiments[i] = exp
+                return
+        self.state.add_experiment(exp)
     def baseline(self) -> dict[str, dict[str, float]]:
         """Log a dummy and a linear baseline; returns {name: metrics}."""
         task = self._require_split()

@@ -6,6 +6,7 @@ covers them; only the base URL, key and model id differ.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -125,8 +126,10 @@ class LLMClient:
         try:
             stream = await self._create(kwargs, with_usage=True)
         except Exception as exc:  # noqa: BLE001 - re-raised below when it is a tools problem
-            if tools and _is_stream_options_error(exc):
-                # Some local servers reject stream_options; drop it and retry once.
+            if _is_stream_options_error(exc):
+                # Some local servers reject stream_options. It is sent on every
+                # request, not only the ones carrying tools, so the retry must
+                # not be gated on that.
                 try:
                     stream = await self._create(kwargs, with_usage=False)
                 except Exception as exc2:  # noqa: BLE001
@@ -138,44 +141,69 @@ class LLMClient:
         slots: dict[int, dict[str, Any]] = {}
         usage = Usage()
 
-        async for chunk in stream:
-            usage_chunk = getattr(chunk, "usage", None)
-            if usage_chunk is not None:
-                usage = Usage(
-                    prompt_tokens=getattr(usage_chunk, "prompt_tokens", 0) or 0,
-                    completion_tokens=getattr(usage_chunk, "completion_tokens", 0) or 0,
-                    total_tokens=getattr(usage_chunk, "total_tokens", 0) or 0,
-                )
-            choices = getattr(chunk, "choices", None) or []
-            if not choices:
-                continue
-            delta = getattr(choices[0], "delta", None)
-            if delta is None:
-                continue
-            content = getattr(delta, "content", None)
-            if content:
-                text_parts.append(content)
-                yield ("text", content)
-            for tc in getattr(delta, "tool_calls", None) or []:
-                idx = getattr(tc, "index", 0) or 0
-                incoming_id = getattr(tc, "id", None) or ""
-                slot = slots.get(idx)
-                # A different id at the same index is a *new* call, not more of
-                # the same one. Providers that omit `index` report every call
-                # as index 0, so without this they would collapse into one slot
-                # and concatenate their argument fragments into garbage. The
-                # new call gets its own slot rather than displacing the old.
-                if slot is not None and incoming_id and slot["id"] and incoming_id != slot["id"]:
-                    idx = next((n for n in range(len(slots) + 1) if n not in slots), idx)
-                slot = slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if incoming_id:
-                    slot["id"] = incoming_id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["name"] = fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["arguments"] += fn.arguments
+        try:
+            async for chunk in stream:
+                usage_chunk = getattr(chunk, "usage", None)
+                if usage_chunk is not None:
+                    usage = Usage(
+                        prompt_tokens=getattr(usage_chunk, "prompt_tokens", 0) or 0,
+                        completion_tokens=getattr(usage_chunk, "completion_tokens", 0) or 0,
+                        total_tokens=getattr(usage_chunk, "total_tokens", 0) or 0,
+                    )
+                choices = getattr(chunk, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                content = getattr(delta, "content", None)
+                if content:
+                    text_parts.append(content)
+                    yield ("text", content)
+                for tc in _tool_deltas(delta):
+                    idx, slot = _slot_for(slots, tc)
+                    fn = getattr(tc, "function", None)
+                    if getattr(tc, "id", None):
+                        slot["id"] = tc.id
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            slot["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            slot["arguments"] += fn.arguments
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            # A gateway hiccup mid-request (a corrupt SSE frame, a dropped
+            # socket) is worth one retry, but only if nothing has been shown
+            # to the user yet -- otherwise the retry would duplicate output.
+            if text_parts or not is_transient(exc):
+                raise _wrap(exc, tools) from exc
+            try:
+                stream = await self._create(kwargs, with_usage=False)
+                async for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    if delta is None:
+                        continue
+                    if getattr(delta, "content", None):
+                        text_parts.append(delta.content)
+                        yield ("text", delta.content)
+                    for tc in _tool_deltas(delta):
+                        idx, slot = _slot_for(slots, tc)
+                        fn = getattr(tc, "function", None)
+                        if getattr(tc, "id", None):
+                            slot["id"] = tc.id
+                        if fn is not None:
+                            if getattr(fn, "name", None):
+                                slot["name"] = fn.name
+                            if getattr(fn, "arguments", None):
+                                slot["arguments"] += fn.arguments
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc2:  # noqa: BLE001
+                raise _wrap(exc2, tools) from exc2
 
         self.last_usage = usage
         tool_calls = [
@@ -259,17 +287,63 @@ class LLMClient:
         return SelfTestResult(True, self.settings.model, "tool calling works")
 
 
-# -- helpers ------------------------------------------------------------
-def _is_stream_options_error(exc: Exception) -> bool:
+def is_transient(exc: Exception) -> bool:
+    """True for a failure worth retrying: a corrupt SSE frame, a dropped socket."""
+    name = type(exc).__name__.lower()
+    if any(k in name for k in ("apistatus", "badrequest", "authentication", "permission", "notfound")):
+        return False
     text = str(exc).lower()
-    return "stream_options" in text or "stream options" in text
+    return any(marker in text for marker in _TRANSIENT_MARKERS) or "apierror" in name
+
+
+# -- helpers ------------------------------------------------------------
+
+def _tool_deltas(delta: Any) -> list[Any]:
+    """The tool_call fragments in one delta, tolerating a missing attribute."""
+    return list(getattr(delta, "tool_calls", None) or [])
+
+
+def _slot_for(slots: dict[int, dict[str, Any]], tc: Any) -> tuple[int, dict[str, Any]]:
+    """Find (or allocate) the accumulator slot for one tool-call fragment.
+
+    A different ``id`` at the same index is a *new* call, not more of the same
+    one: providers that omit ``index`` report every call as index 0, so without
+    this they would collapse into a single slot and their argument fragments
+    would concatenate into unparseable garbage. The new call gets its own slot
+    rather than displacing the old one.
+    """
+    idx = getattr(tc, "index", 0) or 0
+    incoming_id = getattr(tc, "id", None) or ""
+    slot = slots.get(idx)
+    if slot is not None and incoming_id and slot["id"] and incoming_id != slot["id"]:
+        idx = next((n for n in range(len(slots) + 1) if n not in slots), idx)
+    return idx, slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+
+def _is_stream_options_error(exc: Exception) -> bool:
+    return "stream_options" in str(exc).lower().replace("-", "_").replace(" ", "_")
+
+
+#: Failures that are worth one silent retry: a corrupt SSE frame or a dropped
+#: connection part-way through a response, before anything reached the user.
+_TRANSIENT_MARKERS = (
+    "json error",
+    "incomplete",
+    "server disconnected",
+    "connection reset",
+    "connection error",
+    "timeout",
+    "timed out",
+    "eof occurred",
+    "remotelyclosed",
+)
 
 
 def _wrap(exc: Exception, tools: list[dict[str, Any]] | None) -> Exception:
     """Turn provider errors into something the agent can show the user."""
-    if tools and isinstance(exc, ToolCallNotSupported):
+    if isinstance(exc, ToolCallNotSupported):
         return exc
     text = str(exc)
+    lowered = text.lower()
     if tools and ("tool" in text.lower() and ("not support" in text.lower() or "invalid" in text.lower())):
         return ToolCallNotSupported(text)
     return exc

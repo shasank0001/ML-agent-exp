@@ -48,7 +48,6 @@ DESTRUCTIVE_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bos\s*\.\s*system\s*\(", "shells out via os.system()"),
     (r"\bos\s*\.\s*popen\s*\(", "shells out via os.popen()"),
     (r"\bsubprocess\s*\.", "shells out via subprocess"),
-    (r"\b__import__\s*\(", "reaches a module through __import__()"),
     (r"\.unlink\s*\(", "calls .unlink() on a file"),
     (r"\.rmdir\s*\(", "calls .rmdir() on a directory"),
     (r"(?<![\w.])rmtree\s*\(", "calls rmtree()"),
@@ -105,8 +104,13 @@ _DESTRUCTIVE_CALLS = frozenset(
         "shutil.rmtree", "shutil.move",
         "subprocess.run", "subprocess.call", "subprocess.Popen", "subprocess.check_output",
         "subprocess.check_call", "subprocess.getoutput", "subprocess.getstatusoutput",
-        "__import__",
     }
+)
+
+#: Bare attribute names that are destructive on a dynamically imported module.
+_DESTRUCTIVE_ATTRS = frozenset(
+    {"remove", "unlink", "rmdir", "rename", "replace", "renames", "mkdir", "makedirs",
+     "chmod", "chown", "truncate", "_exit", "system", "popen"}
 )
 
 #: Short fragments that make a string literal worth re-reading.
@@ -222,6 +226,22 @@ def _dotted_args(node: ast.AST) -> set[str]:
     return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
 
 
+def _imported_module(node: ast.Call) -> str:
+    """The module name when a call is a method on ``__import__("...")``."""
+    func = node.func
+    if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Call):
+        return ""
+    return _imported_module_self(func.value)
+
+
+def _imported_module_self(node: ast.Call) -> str:
+    """The module name a bare ``__import__("...")`` names, if any."""
+    if _dotted_name(node.func) != "__import__" or not node.args:
+        return ""
+    first = node.args[0]
+    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else ""
+
+
 def _strings_in_node(node: ast.AST) -> list[str]:
     """Every string constant reachable from ``node``, including f-string parts."""
     out: list[str] = []
@@ -277,6 +297,10 @@ def _ast_destructive_issues(tree: ast.AST) -> list[str]:
         fn = _dotted_name(node.func)
         if fn in _DESTRUCTIVE_CALLS:
             issues.append(f"it calls {fn}()")
+        elif _imported_module(node) in _SENSITIVE_MODULES and fn.rsplit(".", 1)[-1] in _DESTRUCTIVE_ATTRS:
+            # `__import__("os").remove(p)` reaches the module as a string
+            # literal rather than a Name, so the denylist on the bare name misses it.
+            issues.append(f"it calls {_imported_module(node)}.{fn.rsplit('.', 1)[-1]}() via __import__()")
         elif fn == "getattr" and _dotted_args(node) & _SENSITIVE_MODULES:
             issues.append("it reaches a destructive helper through getattr()")
         elif fn == "getattr" and any(
@@ -285,6 +309,11 @@ def _ast_destructive_issues(tree: ast.AST) -> list[str]:
             for a in node.args
         ):
             issues.append("it reaches a destructive helper through getattr()")
+        elif fn == "__import__" and (
+            _imported_module_self(node) in _SENSITIVE_MODULES
+            or _dotted_args(node) & _SENSITIVE_MODULES
+        ):
+            issues.append("it reaches a sensitive module through __import__()")
         elif fn in {"eval", "exec"} and any(
             _string_looks_destructive(s) for s in _strings_in_node(node)
         ):

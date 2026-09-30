@@ -26,13 +26,16 @@ from .conversation import (
 )
 from .events import Event, EventLogger, redact_data
 from .lab import LabSession
-from .llm import LLMClient, SelfTestResult, ToolCall
+from .llm import LLMClient, SelfTestResult, ToolCall, is_transient
 from .prompts import build_system_prompt
 from .state import ResearchState
 from .tool_dispatch import ToolDispatcher
 from .tools import TOOL_SCHEMAS, ToolContext
 from .tools.files import copy_upload
 from .tools.python_exec import PythonExecutor
+
+#: How many times a step that failed *before* showing any output is re-issued.
+TRANSIENT_STEP_RETRIES = 2
 
 ApprovalFn = Callable[[ApprovalRequest], Awaitable[bool]]
 AskUserFn = Callable[[str, list[str]], Awaitable[str]]
@@ -217,33 +220,10 @@ class Agent:
                 if self._cancelled:
                     await self._push(queue, self._emit("error", {"message": "Run cancelled."}))
                     return
-                text_parts: list[str] = []
-                tool_calls: list[ToolCall] = []
-                try:
-                    async for kind, payload in self.llm.stream(self._context(), TOOL_SCHEMAS):
-                        if kind == "text":
-                            text_parts.append(payload)
-                            await self._push(queue, self._emit("assistant_delta", {"text": payload}))
-                        elif kind == "tool_calls":
-                            tool_calls = payload
-                        elif kind == "usage":
-                            self._add_usage(payload.to_dict())
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - provider/network failure
-                    await self._push(
-                        queue,
-                        self._emit(
-                            "error",
-                            {
-                                "message": f"The model call failed: {type(exc).__name__}: {exc}",
-                                "fatal": True,
-                            },
-                        ),
-                    )
+                text, tool_calls = await self._stream_step(queue)
+                if text is None:
                     return
 
-                text = "".join(text_parts).strip()
                 if text:
                     self.messages.append({"role": "assistant", "content": text})
                     await self._push(queue, self._emit("assistant_message", {"text": text}))
@@ -303,6 +283,66 @@ class Agent:
             self._known_calls = []
             self._trim_context()
             await queue.put(None)
+
+    async def _stream_step(
+        self, queue: asyncio.Queue
+    ) -> tuple[str | None, list[ToolCall]]:
+        """Run one LLM turn, retrying a transient failure that showed nothing.
+
+        Returns ``(text, tool_calls)``, or ``(None, [])`` when the provider is
+        genuinely unreachable and the turn must end. A stream that broke after
+        it had already started showing output is not retried — replaying it
+        would duplicate text the user has read.
+        """
+        last: Exception | None = None
+        for attempt in range(TRANSIENT_STEP_RETRIES + 1):
+            text_parts: list[str] = []
+            tool_calls: list[ToolCall] = []
+            try:
+                async for kind, payload in self.llm.stream(self._context(), TOOL_SCHEMAS):
+                    if kind == "text":
+                        text_parts.append(payload)
+                        await self._push(queue, self._emit("assistant_delta", {"text": payload}))
+                    elif kind == "tool_calls":
+                        tool_calls = payload
+                    elif kind == "usage":
+                        self._add_usage(payload.to_dict())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider/network failure
+                last = exc
+                if text_parts or not is_transient(exc) or attempt == TRANSIENT_STEP_RETRIES:
+                    break
+                await self._push(
+                    queue,
+                    self._emit(
+                        "warning",
+                        {
+                            "message": (
+                                f"The model connection blipped ({type(exc).__name__}); "
+                                f"retrying ({attempt + 1}/{TRANSIENT_STEP_RETRIES})."
+                            )
+                        },
+                    ),
+                )
+                continue
+            return "".join(text_parts).strip(), tool_calls
+
+        await self._push(
+            queue,
+            self._emit(
+                "error",
+                {
+                    "message": (
+                        f"The model call was interrupted: {type(last).__name__}: {last}. "
+                        "Everything computed so far is in the research state — send another "
+                        "message and I will pick it up from there."
+                    ),
+                    "fatal": not text_parts,
+                },
+            ),
+        )
+        return None, []
 
     # -- history repair --------------------------------------------------
     def _answer_orphans(self, reason: str | None = None) -> None:

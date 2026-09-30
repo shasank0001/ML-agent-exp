@@ -107,7 +107,8 @@ class RecordingAskUser:
 
 
 # -- a small rule-based agent, for offline rehearsal --------------------
-_TARGET_RE = re.compile(r"predict(?:s|ing)?\s+`?([A-Za-z_][A-Za-z0-9_ ]*)`?", re.I)
+#: "predict `churned`", "predicts churned", "to predict the column x"
+_TARGET_RE = re.compile(r"predict(?:s|ing)?\s+(?:the\s+\w+\s+)?`?([A-Za-z_][A-Za-z0-9_]*)`?", re.I)
 
 
 @dataclass
@@ -168,9 +169,13 @@ class PolicyLLM:
     def _next_turn(self, messages: list[dict[str, Any]]) -> Turn:
         outputs = self._tool_outputs(messages)
         done = {name for name, _ in outputs}
-        state_text = messages[0]["content"] if messages else ""
-        if "Task: not defined yet" in state_text and not self.target:
-            match = _TARGET_RE.search(state_text)
+        # Read the target out of what the *user* asked, the way a real model
+        # would, rather than scraping the system prompt.
+        if not self.target:
+            asked = " ".join(
+                str(m.get("content", "")) for m in messages if m.get("role") == "user"
+            )
+            match = _TARGET_RE.search(asked)
             if match:
                 self.target = match.group(1).strip().strip("`")
         path = self._dataset_path(messages)

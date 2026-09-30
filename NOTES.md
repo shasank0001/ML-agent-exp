@@ -105,6 +105,33 @@ bottom is for things deliberately **not** built.
   string contains a destructive call. Flagging them unconditionally would make
   the dialog useless.
 
+### Found by running it against a real model
+A live rehearsal against `stealth/space-bunny-alpha` on OpenRouter (800-row
+churn dataset) exposed four things the offline rehearsal could not:
+
+1. **The agent read `lab`'s own source with `inspect.getsource`** to work out
+   how to re-split, then poked `lab.X_train = None` to bust the cache — a
+   private attribute, and a class of mistake a user watching the chat would see.
+   Fixed by (a) adding `lab.split(..., force=True)` and `lab.reset_split()`, and
+   (b) putting the complete `lab` API in the system prompt with "you do not need
+   to read `lab`'s source or use `dir()`/`inspect`". The same run went from 25
+   steps (hitting the budget) to 9.
+2. **Re-running the baselines logged duplicate experiments.** After a
+   re-split, `baseline_logreg` appeared twice with different numbers, and the
+   results table invited the reader to compare a run against itself.
+   `lab.evaluate` now replaces an experiment of the same name.
+3. **A transient provider hiccup ended the turn.** OpenRouter occasionally
+   injects a corrupt SSE frame (`APIError: JSON error injected into SSE
+   stream`). The OpenAI SDK does not retry that, so the turn died mid-task.
+   `llm.stream` now retries a request that failed before showing any output, and
+   the agent retries the whole step twice more; a failure after output has
+   started is surfaced as a non-fatal message telling the model to continue from
+   the research state.
+4. **`__import__("sklearn.ensemble")` triggered a false-positive approval**
+   prompt. The gate now flags `__import__` only when it names a sensitive
+   module, and `__import__("os").remove(p)` is caught by a precise rule instead
+   of a blanket one.
+
 ### UI (`app.py`)
 - **One `cl.Step` per tool call**, updated in place when the result arrives
   (`tool_start` opens it, `tool_result` fills it), rather than a separate
@@ -198,7 +225,14 @@ bottom is for things deliberately **not** built.
   would survive longer sessions better; the state summary already carries most
   of the durable content, so V1 was left simple.
 - Approval timeouts (30 min) and `MAX_STEPS=40` are demo-tuned. Neither has been
-  swept.
+  swept. One live run used 9 steps and 46k prompt tokens for the full golden path;
+  a careful exploratory run used 25 and 153k. Both fit, but the ceiling is close.
+- `stealth/space-bunny-alpha` occasionally emits a malformed SSE frame through
+  OpenRouter. The step retry absorbs it, but a model that fails this way often
+  will feel slow. Worth re-checking before a demo.
+- The approval gate flags a cell for `n_jobs=-1` even when the cell is fast.
+  That is a deliberate false positive (it does use every core), but it is the
+  kind of prompt that trains users to click Approve without reading.
 
 ---
 

@@ -180,6 +180,9 @@ async def _render_events(agent: Agent, text: str) -> None:
             elif kind == "state_update":
                 await _publish_plan(agent, data)
 
+            elif kind == "warning":
+                await cl.Message(content=data.get("message", "")).send()
+
             elif kind == "error":
                 await cl.ErrorMessage(
                     content=str(data.get("message", "Something went wrong."))
