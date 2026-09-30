@@ -40,18 +40,33 @@ bottom is for things deliberately **not** built.
   has to be right. Splitting it into `lab.py` + `lab_encode.py` was considered
   and rejected as churn for V1.
 
-### `datalab/agent.py`
+### `datalab/agent.py`, `conversation.py`, `tool_dispatch.py`
 - **The loop is driven by a task, not directly by the generator.** `run()`
   delegates to `_drive()` running as an `asyncio.Task` that pushes events onto
   a queue. Without this, Chainlit's stop button has nothing to cancel: an async
   generator only runs while the consumer is pulling from it, so
-  `agent.cancel()` had no handle. The queue adds ~25 lines and buys working
-  cancellation.
+  `agent.cancel()` had no handle.
+- **The driver yields to the loop after every event.** `Queue.put` on an
+  unbounded queue never suspends, so a turn made only of fast tools ran all the
+  way to the step budget without the UI ever getting a slot — and the stop
+  button had nothing to interrupt. One `asyncio.sleep(0)` per event fixed it.
+- **`conversation.py` owns the message history.** Building messages, bounding
+  the window, and repairing orphaned tool calls are fiddly enough to deserve
+  their own module; keeping them in `agent.py` pushed it past 500 lines.
+- **`tool_dispatch.py` owns "a tool call arrived".** Resolving the tool,
+  deciding on approval, running the handler and turning the outcome into events
+  is a separate concern from the loop that calls it.
+- **The tool_call/tool pairing invariant is enforced once per turn**, at the end
+  of `_drive`, rather than at each of the several places a turn can stop. An
+  assistant message carrying `tool_calls` with no matching tool response makes
+  the OpenAI API reject every later request, so it is worth being structural
+  about.
 - **Token usage is reported on the `done` event** (per-turn and per-session)
   rather than as its own event type, to keep the `EventType` literal exactly as
   specified. Only providers that return usage populate it.
 - **The in-process message history is bounded** to `3 * context_window_messages`
-  after a turn. `events.jsonl` keeps the full transcript, so nothing is lost.
+  after a turn, cut only at a point where no tool call is orphaned.
+  `events.jsonl` keeps the full transcript, so nothing is lost.
 
 ### `datalab/events.py`
 - **`EventType` has two extra members** beyond the spec's list: `ask_user` and
@@ -68,7 +83,15 @@ bottom is for things deliberately **not** built.
   "what files are there?", and a non-recursive root listing returns only the
   three sub-folders.
 
-### `datalab/approvals.py`
+### `datalab/approvals.py` + `datalab/approval_heuristics.py`
+- **Split in two.** The policy (which rule fires, what the dialog says, what
+  happens on each answer) is in `approvals.py`; the code-shape analysis is in
+  `approval_heuristics.py`. A single file reached 650 lines once the AST pass
+  landed, well past the "keep modules small" convention.
+- **The analysis is regex + a light `ast` pass, not regex alone.** Regexes miss
+  f-strings, `getattr(os, "remove")`, `n_estimators=10**5` and `Path(x) / ".."`.
+  The AST pass closes those; the regexes are kept as a backstop for cells that
+  will not parse.
 - **Path-safety heuristics understand "anchored" expressions.** A literal like
   `'/clean.csv'` inside `df.to_csv(OUTPUT_DIR + '/clean.csv')` is a suffix of a
   known-safe root, not an absolute path. Without this, every legitimate write to
@@ -77,6 +100,10 @@ bottom is for things deliberately **not** built.
 - **A missing `est_seconds` is itself a reason to ask** on a heavy cell, and the
   prompt tells the model to supply the estimate next time (the spec asks for
   this in rule 4).
+- **`getattr` / `eval` / `exec` are only flagged when they actually look
+  dangerous** — a `getattr` whose args name a sensitive module, an `eval` whose
+  string contains a destructive call. Flagging them unconditionally would make
+  the dialog useless.
 
 ### UI (`app.py`)
 - **One `cl.Step` per tool call**, updated in place when the result arrives
@@ -102,12 +129,19 @@ bottom is for things deliberately **not** built.
    cases. Documented in `README.md`.
 2. **The Python soft timeout cannot kill a thread.** `asyncio.wait_for` gives
    up on the await, but the worker thread keeps running. A timed-out cell leaves
-   orphaned work behind, and `contextlib.redirect_stdout` stays redirected into
-   that dead thread's buffer. The error message tells the model this, and
-   `NOTES.md` + the code comments say it too. A real fix needs a subprocess or a
-   Jupyter kernel (the "Later" list).
-3. **`redirect_stdout` / `redirect_stderr` are process-global.** Two concurrent
-   sessions would interleave output. Fine for one user; the code says so.
+   orphaned work behind: the thread keeps mutating the shared namespace and the
+   global pyplot state with no lock, racing the next cell. On timeout the
+   process-wide state the cell owned (stdout, stderr, working directory) is put
+   back immediately, because `redirect_stdout` restores whatever was bound when
+   it was *entered* — an abandoned thread's later exit would otherwise rebind a
+   dead buffer over the live process stdout and silently swallow every
+   subsequent print. The error message tells the model all of this. A real fix
+   needs a subprocess or a Jupyter kernel (the "Later" list).
+3. **`os.chdir`, `redirect_stdout` and `redirect_stderr` are all
+   process-global.** Cells run with the session folder as their working
+   directory so that a bare `df.to_csv('out.csv')` lands inside the session
+   rather than in the app's working directory — but that makes concurrency
+   unsafe. Fine for one user; the code says so.
 4. **The approval policy is regex + light AST on the code text**, not a real
    analysis. It catches the shapes in the spec and misses computed or obfuscated
    paths. It is a speed bump, not a security boundary.

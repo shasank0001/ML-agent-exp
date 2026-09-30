@@ -39,6 +39,9 @@ packages = ["datalab"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "slow: end-to-end rehearsal with real model fits (skip with -m 'not slow')",
+]
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]

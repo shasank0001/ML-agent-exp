@@ -158,9 +158,18 @@ class LLMClient:
                 yield ("text", content)
             for tc in getattr(delta, "tool_calls", None) or []:
                 idx = getattr(tc, "index", 0) or 0
+                incoming_id = getattr(tc, "id", None) or ""
+                slot = slots.get(idx)
+                # A different id at the same index is a *new* call, not more of
+                # the same one. Providers that omit `index` report every call
+                # as index 0, so without this they would collapse into one slot
+                # and concatenate their argument fragments into garbage. The
+                # new call gets its own slot rather than displacing the old.
+                if slot is not None and incoming_id and slot["id"] and incoming_id != slot["id"]:
+                    idx = next((n for n in range(len(slots) + 1) if n not in slots), idx)
                 slot = slots.setdefault(idx, {"id": "", "name": "", "arguments": ""})
-                if getattr(tc, "id", None):
-                    slot["id"] = tc.id
+                if incoming_id:
+                    slot["id"] = incoming_id
                 fn = getattr(tc, "function", None)
                 if fn is not None:
                     if getattr(fn, "name", None):

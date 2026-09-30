@@ -184,3 +184,172 @@ def test_other_tools_never_ask(state: ResearchState, session: Path) -> None:
     for name in ("profile_dataset", "read_file", "list_files", "todo", "query_state", "ask_user"):
         call = ToolCall(id="c", name=name, arguments={"path": "x"})
         assert needs_approval(call, state, session_dir=session) is None
+
+
+# -- new destructive patterns: process execution ------------------------
+@pytest.mark.parametrize(
+    "code",
+    [
+        'os.system("rm -rf x")',
+        'subprocess.run(["rm", "-rf", "x"])',
+        'subprocess.call(["rm", "-rf", "x"])',
+        'subprocess.Popen(["rm", "-rf", "x"])',
+        'subprocess.check_output(["ls"])',
+        'os.popen("ls")',
+    ],
+)
+def test_process_execution_asks(state: ResearchState, session: Path, code: str) -> None:
+    request = ask(state, session, code)
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+# -- new destructive patterns: rename / mkdir / chmod -------------------
+@pytest.mark.parametrize(
+    "code",
+    [
+        "os.rename(a, b)",
+        "os.replace(a, b)",
+        "os.renames(a, b)",
+        'os.mkdir("newdir")',
+        'os.makedirs("a/b")',
+        'os.chmod("f", 0o644)',
+        'os.chown("f", 0, 0)',
+        'os.truncate("f", 0)',
+        "os._exit(0)",
+    ],
+)
+def test_filesystem_mutation_asks(state: ResearchState, session: Path, code: str) -> None:
+    request = ask(state, session, code)
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+# -- new destructive patterns: obfuscated calls --------------------------
+@pytest.mark.parametrize(
+    "code",
+    [
+        '__import__("os").remove("x")',
+        'getattr(os, "remove")(p)',
+        'getattr(__builtins__, "eval")("1+1")',
+        'eval("os.remove(\'x\')")',
+        'exec("os.remove(\'x\')")',
+    ],
+)
+def test_obfuscated_destructive_calls_ask(
+    state: ResearchState, session: Path, code: str
+) -> None:
+    request = ask(state, session, code)
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+def test_path_division_traversal_asks(state: ResearchState, session: Path) -> None:
+    request = ask(state, session, 'Path(DATA_DIR) / ".." / ".." / "x"')
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+def test_fstring_write_outside_asks(state: ResearchState, session: Path) -> None:
+    request = ask(state, session, 'df.to_csv(f"{DATA_DIR}/../data/raw.csv")')
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+def test_open_without_visible_literal_asks(state: ResearchState, session: Path) -> None:
+    request = ask(state, session, 'm = "w"; open(p, mode=m)')
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+def test_open_variable_in_read_mode_does_not_ask(
+    state: ResearchState, session: Path
+) -> None:
+    assert ask(state, session, "data = open(p).read()") is None
+    assert ask(state, session, "data = open(p, 'r')") is None
+
+
+# -- new destructive patterns: shutil copies outside ----------------------
+@pytest.mark.parametrize(
+    "code",
+    [
+        'shutil.copy(src, "/etc/x")',
+        'shutil.move(src, "/etc/y")',
+        'shutil.copytree(src, "/etc/z")',
+    ],
+)
+def test_shutil_copy_outside_asks(state: ResearchState, session: Path, code: str) -> None:
+    request = ask(state, session, code)
+    assert request is not None
+    assert "destructive" in request.title.lower()
+
+
+def test_shutil_copy_with_bare_variables_does_not_ask(
+    state: ResearchState, session: Path
+) -> None:
+    assert ask(state, session, "shutil.copy(a, b)") is None
+
+
+def test_write_with_bare_variable_does_not_crash_or_ask(
+    state: ResearchState, session: Path
+) -> None:
+    assert ask(state, session, "df.to_csv(path_variable)") is None
+
+
+# -- new heavy-compute patterns --------------------------------------------
+@pytest.mark.parametrize(
+    "code",
+    [
+        "RandomForestClassifier(n_estimators=10**5).fit(X, y)",
+        "RandomForestClassifier(n_estimators=int(1e5)).fit(X, y)",
+        "RandomForestClassifier(n_estimators=5000).fit(X, y)",
+        'params = {"n_estimators": 100000}\nClf(**params)',
+    ],
+)
+def test_large_n_estimators_asks(state: ResearchState, session: Path, code: str) -> None:
+    request = ask(state, session, code)
+    assert request is not None
+    assert "Heavy compute" in request.title
+
+
+# -- safe code from the Task 2 list does not ask -----------------------------
+def test_safe_code_does_not_ask(state: ResearchState, session: Path) -> None:
+    safe = [
+        "df.to_csv('out.csv')",
+        "df.to_csv('cleaned.parquet')",
+        "df.to_csv(OUTPUT_DIR + '/clean.csv', index=False)",
+        "df.to_csv(os.path.join(OUTPUT_DIR, 'clean.csv'))",
+        "pd.read_csv(DATA_DIR + '/data.csv')",
+        "open('notes.txt').read()",
+        "open('x.csv').read()",
+        "plt.savefig('plots/hist.png')",
+        "plt.savefig(FIGURES_DIR + '/h.png')",
+        "df.to_parquet('cleaned.parquet')",
+        "open(OUTPUT_DIR + '/report.md', 'w').write(text)",
+        "RandomForestClassifier(n_estimators=100).fit(X, y)",
+        "LogisticRegression(max_iter=2000)",
+        "cross_val_score(model, X, y, cv=5)",
+        "json.dump(results, open(OUTPUT_DIR + '/r.json', 'w'))",
+        "pd.read_excel(DATA_DIR + '/d.xlsx')",
+        "print('hello')\nx = 1 + 1\nplt.plot([1, 2])",
+    ]
+    for code in safe:
+        assert ask(state, session, code) is None, f"false positive for: {code!r}"
+
+
+# -- dialog quality: the reason must name the risk ------------------------------
+def test_reason_names_the_risk(state: ResearchState, session: Path) -> None:
+    request = ask(state, session, 'os.system("rm -rf x")')
+    assert request is not None
+    assert "os.system" in request.reason
+    heavy = ask(state, session, "RandomForestClassifier(n_estimators=5000).fit(X, y)")
+    assert heavy is not None
+    assert "n_estimators" in heavy.reason
+
+
+# -- totality: broken cells never block the agent ----------------------------------
+@pytest.mark.parametrize("code", ["def broken(:", "((((", ""])
+def test_broken_cell_returns_none(
+    state: ResearchState, session: Path, code: str
+) -> None:
+    assert ask(state, session, code) is None

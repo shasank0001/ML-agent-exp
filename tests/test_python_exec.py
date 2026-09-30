@@ -196,3 +196,28 @@ async def test_variable_names_lists_user_names(executor: PythonExecutor) -> None
     names = executor.variable_names()
     assert "my_frame" in names
     assert "pd" not in names
+
+
+async def test_cells_run_inside_the_session_folder(executor: PythonExecutor) -> None:
+    """A bare relative write must land in the session, not the app's CWD."""
+    result = await executor.run("open('probe.txt', 'w').write('hi')")
+    assert not result.error
+    assert (executor.session_dir / "probe.txt").read_text(encoding="utf-8") == "hi"
+    assert not (Path.cwd() / "probe.txt").exists()
+
+
+async def test_working_directory_is_restored_after_a_cell(executor: PythonExecutor) -> None:
+    before = Path.cwd()
+    await executor.run("x = 1")
+    await executor.run("raise ValueError('boom')")
+    assert Path.cwd() == before
+
+
+async def test_stdout_is_restored_after_a_timeout(executor: PythonExecutor) -> None:
+    """An abandoned cell must not leave the process stdout pointed at a dead buffer."""
+    import sys as _sys
+
+    real = _sys.stdout
+    result = await executor.run("import time\ntime.sleep(3)", timeout_s=1)
+    assert result.error
+    assert _sys.stdout is real

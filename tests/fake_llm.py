@@ -7,6 +7,7 @@ the real tools — it is how the golden path is rehearsed offline.
 
 from __future__ import annotations
 
+import itertools
 import json
 import re
 from dataclasses import dataclass, field
@@ -17,10 +18,17 @@ from datalab.llm import SelfTestResult, ToolCall, Usage
 Turn = tuple[str, list[ToolCall]]
 
 
+_CALL_SEQ = itertools.count(1)
+
+
 def call(name: str, **args: Any) -> ToolCall:
-    """Build a ToolCall the way the OpenAI client would."""
-    return ToolCall(id=f"call_{name}_{abs(hash(name + json.dumps(args, sort_keys=True))) % 10**8}",
-                    name=name, arguments=args, raw_arguments=json.dumps(args))
+    """Build a ToolCall the way the OpenAI client would, with a unique id."""
+    return ToolCall(
+        id=f"call_{name}_{next(_CALL_SEQ)}",
+        name=name,
+        arguments=args,
+        raw_arguments=json.dumps(args),
+    )
 
 
 @dataclass
@@ -52,6 +60,10 @@ class ScriptedLLM:
                 return
         text, calls = self.turns[self.index]
         self.index += 1
+        # A real provider mints a fresh id per call; repeating one would make
+        # the history look malformed when it is not.
+        calls = [ToolCall(id=f"{c.id}_{self.index}", name=c.name,
+                          arguments=c.arguments, raw_arguments=c.raw_arguments) for c in calls]
         for i in range(0, len(text), 24):
             yield ("text", text[i : i + 24])
         yield ("tool_calls", list(calls))

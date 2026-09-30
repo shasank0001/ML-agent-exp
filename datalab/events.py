@@ -78,10 +78,15 @@ class EventLogger:
 
     # -- persistence ----------------------------------------------------
     def log(self, event: Event) -> None:
-        """Record an event; persist it unless it is a transient stream delta."""
-        self._buffer.append(event)
+        """Record an event; persist it unless it is a transient stream delta.
+
+        Stream deltas are deliberately *not* kept in memory either: a long
+        session would otherwise accumulate every token it ever rendered. The
+        final ``assistant_message`` carries the same text.
+        """
         if event.type in TRANSIENT_EVENT_TYPES:
             return
+        self._buffer.append(event)
         payload = redact_data(event.model_dump(mode="json"), self._secrets)
         line = json.dumps(payload, ensure_ascii=False, default=str)
         with self._lock, self.path.open("a", encoding="utf-8") as fh:
@@ -90,7 +95,7 @@ class EventLogger:
     # -- reading --------------------------------------------------------
     @property
     def events(self) -> list[Event]:
-        """Every event created in this process, including transients."""
+        """Every persisted event from this process, in order."""
         return list(self._buffer)
 
     def read_all(self) -> list[dict[str, Any]]:

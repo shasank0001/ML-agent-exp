@@ -16,10 +16,11 @@ import chainlit as cl
 from datalab.agent import Agent
 from datalab.approvals import ApprovalRequest
 from datalab.config import Settings, load_settings
-from datalab.llm import LLMClient
+from datalab.llm import LLMClient, SelfTestResult
 
 APPROVAL_TIMEOUT_S = 900
 ASK_USER_TIMEOUT_S = 1_800
+SELF_TEST_TIMEOUT_S = 30
 PREVIEW_CHARS = 60
 
 #: The agent's to-do statuses mapped onto Chainlit's TaskStatus enum.
@@ -51,7 +52,6 @@ async def on_chat_start() -> None:
             "Upload a CSV and tell me what to predict, or just ask a question about your data."
         ),
         author="DataLab",
-        type="system",
     ).send()
 
     if not settings.is_configured:
@@ -63,13 +63,22 @@ async def on_chat_start() -> None:
                 + "\n```\n"
             ),
             author="DataLab",
-            type="system",
         ).send()
         return
 
     probe = cl.Message(content="Checking that the model can call tools…", author="DataLab")
     await probe.send()
-    result = await agent.run_self_test()
+    # Bounded: an unreachable base_url would otherwise block chat start for
+    # minutes behind the OpenAI client's own (much longer) retry budget.
+    try:
+        result = await asyncio.wait_for(agent.run_self_test(), timeout=SELF_TEST_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - a failed probe must not block chat start
+        reason = (
+            f"no response within {SELF_TEST_TIMEOUT_S}s"
+            if isinstance(exc, asyncio.TimeoutError)
+            else f"{type(exc).__name__}: {exc}"
+        )
+        result = SelfTestResult(False, settings.model or "(unset)", reason)
     await probe.remove()
     if result.ok:
         await cl.Message(
@@ -105,7 +114,6 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(
             content="This session is not initialised. Reload the page to start a new one.",
             author="DataLab",
-            type="system",
         ).send()
         return
 
@@ -113,7 +121,6 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(
             content="Set the missing values in `.env` (see the start of this chat) and restart.",
             author="DataLab",
-            type="system",
         ).send()
         return
 
@@ -123,8 +130,8 @@ async def on_message(message: cl.Message) -> None:
             continue
         try:
             copied = agent.add_attachment(Path(element.path))
-        except OSError as exc:
-            notes.append(f"Could not copy `{element.name}` into the session: {exc}")
+        except Exception as exc:  # noqa: BLE001 - a bad upload must not kill the handler
+            notes.append(f"Could not copy `{element.name}` into the session: {type(exc).__name__}: {exc}")
             continue
         notes.append(f"Uploaded `{copied.name}` ({copied.stat().st_size:,} bytes) into `DATA_DIR`.")
 
@@ -174,14 +181,12 @@ async def _render_events(agent: Agent, text: str) -> None:
                 await _publish_plan(agent, data)
 
             elif kind == "error":
-                await cl.Message(
-                    content=f"**{data.get('message', 'Something went wrong.')}**",
-                    author="DataLab",
-                    type="error",
+                await cl.ErrorMessage(
+                    content=str(data.get("message", "Something went wrong."))
                 ).send()
 
     except asyncio.CancelledError:
-        await cl.Message(content="**Run cancelled.**", author="DataLab").send()
+        await cl.ErrorMessage(content="Run cancelled.").send()
     finally:
         if stream is not None:
             await stream.update()

@@ -12,6 +12,8 @@ import ast
 import asyncio
 import contextlib
 import io
+import os
+import sys
 import traceback
 from pathlib import Path
 from typing import Any
@@ -106,6 +108,9 @@ class PythonExecutor:
         self.data_dir = Path(data_dir)
         self.output_dir = Path(output_dir)
         self.figures_dir = Path(figures_dir)
+        # Cells run with the session folder as their working directory, so it
+        # has to exist before the first chdir.
+        self.session_dir.mkdir(parents=True, exist_ok=True)
         self.figures_dir.mkdir(parents=True, exist_ok=True)
         self._cell_index = 0
         self.last_result: ToolResult | None = None
@@ -136,16 +141,26 @@ class PythonExecutor:
         """Run one cell. Never raises; failures come back as ``ToolResult(error=True)``."""
         self._cell_index += 1
         index = self._cell_index
+        cwd_before = Path.cwd()
+        out_before, err_before = sys.stdout, sys.stderr
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self._run_sync, code, index), timeout=timeout_s
             )
         except asyncio.TimeoutError:
-            # A thread cannot be killed in-process; the cell may keep running.
+            # A thread cannot be killed in-process, so the cell keeps running.
+            # Put the process-wide state the cell owns back now, rather than
+            # waiting for a thread that may never finish.
+            _restore_streams(out_before, err_before)
+            try:
+                os.chdir(cwd_before)
+            except OSError:
+                pass
             return ToolResult.fail(
                 f"Cell timed out after {timeout_s}s and was abandoned. The worker thread could "
-                "not be killed, so it may still be running in the background. Use a smaller data "
-                "sample, fewer models, or split the work into smaller cells, then try again.",
+                "not be killed, so it may still be running in the background and may still write "
+                "to `lab` state. Use a smaller data sample, fewer models, or split the work into "
+                "smaller cells, then try again.",
                 data={"cell": index, "timed_out": True},
             )
         except Exception as exc:  # noqa: BLE001 - defensive
@@ -162,18 +177,29 @@ class PythonExecutor:
         value: Any = None
         tb = ""
         failed = False
-        # NOTE: redirect_stdout/redirect_stderr are process-global. Acceptable for
-        # a single-user local demo; not safe for concurrent sessions. See NOTES.md.
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        previous_cwd = Path.cwd()
+        previous_out, previous_err = sys.stdout, sys.stderr
+        # NOTE: chdir, redirect_stdout and redirect_stderr are all process-global.
+        # Acceptable for a single-user local demo; not safe for concurrent sessions.
+        # See NOTES.md.
+        try:
+            os.chdir(self.session_dir)
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                try:
+                    body, expr = split_code(code)
+                    if body.strip():
+                        exec(compile(body, "<cell>", "exec"), self.namespace)  # noqa: S102
+                    if expr is not None:
+                        value = eval(expr, self.namespace)  # noqa: S307
+                except BaseException:  # noqa: BLE001 - every failure goes back to the model
+                    failed = True
+                    tb = traceback.format_exc(limit=12)
+        finally:
+            _restore_streams(previous_out, previous_err)
             try:
-                body, expr = split_code(code)
-                if body.strip():
-                    exec(compile(body, "<cell>", "exec"), self.namespace)  # noqa: S102
-                if expr is not None:
-                    value = eval(expr, self.namespace)  # noqa: S307
-            except BaseException:  # noqa: BLE001 - every failure goes back to the model
-                failed = True
-                tb = traceback.format_exc(limit=12)
+                os.chdir(previous_cwd)
+            except OSError:
+                pass
         images = self._save_figures(figures_before, index)
         text = self._compose(tb, out.getvalue(), err.getvalue(), value, failed=failed)
         result = ToolResult(
@@ -214,6 +240,28 @@ class PythonExecutor:
         for num in new:
             plt.close(num)
         return paths
+
+
+def _restore_streams(previous_out: Any = None, previous_err: Any = None) -> None:
+    """Undo a cell's stdout/stderr redirection, even from an abandoned thread.
+
+    ``redirect_stdout`` restores whatever was bound when it was *entered*. A
+    cell that times out leaves its worker thread inside the redirect, so its
+    later exit can rebind a dead ``StringIO`` over the live process stdout and
+    silently swallow every subsequent print. If a cell buffer is still bound,
+    put the stream that was live before the cell back.
+    """
+    for name, previous, real in (
+        ("stdout", previous_out, sys.__stdout__),
+        ("stderr", previous_err, sys.__stderr__),
+    ):
+        if not isinstance(getattr(sys, name), io.StringIO):
+            continue
+        replacement = previous if previous is not None and not isinstance(previous, io.StringIO) else real
+        try:
+            setattr(sys, name, replacement)
+        except Exception:  # noqa: BLE001 - never let cleanup break a cell
+            pass
 
 
 # -- the `python` tool --------------------------------------------------

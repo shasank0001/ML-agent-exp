@@ -8,21 +8,29 @@ objects, each of which is also appended to the session's JSONL log.
 from __future__ import annotations
 
 import asyncio
-import json
-import time
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from .approvals import ApprovalRequest, needs_approval
+from .approvals import ApprovalRequest
 from .config import Settings, ensure_session_dirs
+from .conversation import (
+    answer_orphans,
+    answer_skipped,
+    assistant_tool_calls,
+    tool_message,
+    trim,
+    user_message,
+    window,
+)
 from .events import Event, EventLogger, redact_data
 from .lab import LabSession
 from .llm import LLMClient, SelfTestResult, ToolCall
 from .prompts import build_system_prompt
 from .state import ResearchState
-from .tools import REGISTRY, TOOL_SCHEMAS, ToolContext, ToolResult
+from .tool_dispatch import ToolDispatcher
+from .tools import TOOL_SCHEMAS, ToolContext
 from .tools.files import copy_upload
 from .tools.python_exec import PythonExecutor
 
@@ -83,9 +91,22 @@ class Agent:
         self.usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         self._turn_steps = 0
         self._turn_tool_calls = 0
+        self._known_calls: list[ToolCall] = []
+        self._queue: asyncio.Queue | None = None
         self._cancelled = False
         self._self_test: SelfTestResult | None = None
         self._task: asyncio.Task | None = None
+
+        self.dispatcher = ToolDispatcher(
+            ctx=self.ctx,
+            state=self.state,
+            settings=settings,
+            emit=self._emit,
+            push=self._push_event,
+            append_message=self.messages.append,
+            record_call=self._known_calls.append,
+            request_approval=self.request_approval,
+        )
 
     # -- public API -----------------------------------------------------
     @property
@@ -116,13 +137,25 @@ class Agent:
             self._task.cancel()
 
     async def ask_user(self, question: str, options: list[str] | None = None) -> str:
-        return await self.ask_user_cb(question, list(options or []))
+        """Ask the user through the UI, emitting the round trip as events."""
+        options = list(options or [])
+        await self._maybe_push("ask_user", {"question": question, "options": options})
+        answer = await self.ask_user_cb(question, options)
+        await self._maybe_push("ask_user_response", {"question": question, "answer": answer})
+        return answer
+
+    async def _maybe_push(self, type_: str, data: dict[str, Any]) -> None:
+        """Emit an event outside a turn (e.g. a question asked from a tool)."""
+        if self._queue is None:
+            return
+        await self._queue.put(self._emit(type_, data))
 
     async def run(self, user_text: str) -> AsyncIterator[Event]:
         """Run one turn: stream, call tools, repeat until the model stops."""
         self._cancelled = False
         self._turn_steps = 0
         self._turn_tool_calls = 0
+        self._known_calls = []
         usage_before = dict(self.usage_total)
         done_emitted = False
         try:
@@ -176,6 +209,7 @@ class Agent:
 
     async def _drive(self, queue: asyncio.Queue) -> None:
         """The actual turn. Pushes events into ``queue``; always ends with None."""
+        self._queue = queue
         try:
             repairs = 0
             for _step in range(self.settings.max_steps):
@@ -216,17 +250,17 @@ class Agent:
                 if not tool_calls:
                     return
 
-                self.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": text or None,
-                        "tool_calls": [c.to_message() for c in tool_calls],
-                    }
-                )
-                for call in tool_calls:
-                    outcome = await self._run_one_tool(queue, call)
-                    if outcome is not None:
-                        repairs = 0 if outcome else repairs + 1
+                self.messages.append(assistant_tool_calls(text, tool_calls))
+                for position, call in enumerate(tool_calls):
+                    if self._cancelled:
+                        # The OpenAI API rejects a history where an assistant
+                        # tool_call has no matching tool response, so answer the
+                        # ones we are skipping rather than dropping them.
+                        answer_skipped(self.messages, tool_calls[position:])
+                        await self._push(queue, self._emit("error", {"message": "Run cancelled."}))
+                        return
+                    self._turn_tool_calls += 1
+                    repairs = 0 if await self.dispatcher.run(call) else repairs + 1
                 if repairs > self.settings.max_repairs:
                     await self._push(
                         queue,
@@ -256,157 +290,58 @@ class Agent:
                 ),
             )
         except asyncio.CancelledError:
+            self._answer_orphans("Cancelled: the run was stopped before this finished.")
             self._emit("error", {"message": "Run cancelled."})
+            try:
+                await self._push(queue, self._emit("error", {"message": "Run cancelled."}))
+            except Exception:  # noqa: BLE001 - the queue may already be closed
+                pass
             return
         finally:
+            self._answer_orphans("Not run: the turn ended before this tool could start.")
+            self._queue = None
+            self._known_calls = []
             self._trim_context()
             await queue.put(None)
 
-    # -- one tool call --------------------------------------------------
-    async def _run_one_tool(self, queue: asyncio.Queue, call: ToolCall) -> bool | None:
-        """Run one tool call. Returns whether it succeeded, or ``None`` if it was not run.
+    # -- history repair --------------------------------------------------
+    def _answer_orphans(self, reason: str | None = None) -> None:
+        """Guarantee the history can be sent again.
 
-        Errors are never raised at the caller: they come back to the model as
-        the tool result so the repair loop can act on the traceback.
+        An assistant message carrying ``tool_calls`` must be followed by one
+        tool message per call. Several paths can end a turn between the two
+        (cancellation, the step budget, a provider error), so rather than
+        policing each one, the invariant is enforced once at the end of every
+        turn.
         """
-        spec = REGISTRY.get(call.name)
-        if spec is None:
-            text = (
-                f"Unknown tool '{call.name}'. Available tools: {', '.join(sorted(REGISTRY))}. "
-                "Call one of those instead."
-            )
-            self.messages.append(self._tool_message(call, text))
-            await self._push(
-                queue,
-                self._emit(
-                    "tool_result",
-                    {"id": call.id, "name": call.name, "text": text, "error": True, "images": []},
-                ),
-            )
-            return False
-
-        request: ApprovalRequest | None = None
-        try:
-            request = needs_approval(
-                call,
-                self.state,
-                session_dir=self.paths["root"],
-                threshold_seconds=self.settings.approval_seconds_threshold,
-            )
-        except Exception:  # noqa: BLE001 - a broken heuristic must not block the run
-            request = None
-
-        if request is not None:
-            await self._push(queue, self._emit("approval_request", request.to_dict()))
-            try:
-                approved = bool(await self.request_approval(request))
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - treat an errored prompt as "denied"
-                approved = False
-            await self._push(
-                queue, self._emit("approval_response", {"id": call.id, "approved": approved})
-            )
-            if not approved:
-                text = (
-                    f"The user DENIED this action ({request.title}). Do not retry it as-is. "
-                    "Either do something smaller, or explain what you would do differently and ask."
-                )
-                self.messages.append(self._tool_message(call, text))
-                await self._push(
-                    queue,
-                    self._emit(
-                        "tool_result",
-                        {
-                            "id": call.id,
-                            "name": call.name,
-                            "text": text,
-                            "error": False,
-                            "images": [],
-                        },
-                    ),
-                )
-                return True
-
-        self.tool_call_count += 1
-        self._turn_tool_calls += 1
-        await self._push(queue, self._emit("tool_start", self._tool_start_data(call)))
-        started = time.monotonic()
-        try:
-            result = await spec.handler(call.arguments, self.ctx)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - a handler bug must not kill the turn
-            result = ToolResult.fail(
-                f"Tool '{call.name}' raised {type(exc).__name__}: {exc}\n"
-                f"{traceback.format_exc(limit=8)}"
-            )
-        elapsed = time.monotonic() - started
-
-        text = self.settings.redact(self._truncate(result.text))
-        data = {
-            "id": call.id,
-            "name": call.name,
-            "text": text,
-            "error": result.error,
-            "images": list(result.images),
-            "data": _jsonable(result.data),
-            "elapsed_s": round(elapsed, 2),
-        }
-        self.state.save()
-        await self._push(queue, self._emit("tool_result", data))
-        self.messages.append(self._tool_message(call, text))
-        if self.state.plan:
-            await self._push(queue, self._emit("state_update", self.state.summary_dict()))
-        return not result.error
-
-    def _tool_start_data(self, call: ToolCall) -> dict[str, Any]:
-        data: dict[str, Any] = {"id": call.id, "name": call.name, "arguments": _jsonable(call.arguments)}
-        if call.name == "python":
-            data["code"] = str(call.arguments.get("code") or "")
-            data["description"] = str(call.arguments.get("description") or "Run Python")
-            data["language"] = "python"
-        return data
+        answer_orphans(
+            self.messages,
+            {c.id: c for c in self._known_calls},
+            reason or "Not run: the turn ended before this tool could start.",
+        )
 
     # -- message plumbing -----------------------------------------------
     def _tool_message(self, call: ToolCall, text: str) -> dict[str, Any]:
-        return {"role": "tool", "tool_call_id": call.id, "name": call.name, "content": text}
+        return tool_message(call, text)
 
     def _user_content(self, user_text: str) -> str:
-        """User text plus a note about which files are available in the session."""
-        if not self.attachments:
-            return user_text
-        names = ", ".join(p.name for p in self.attachments)
-        return (
-            f"{user_text}\n\n[files available in DATA_DIR for this session: {names} — "
-            "load one with lab.load(<name>) or pd.read_csv(DATA_DIR + '/<name>')]"
-        )
+        return user_message(user_text, [p.name for p in self.attachments])
 
     def _context(self) -> list[dict[str, Any]]:
         """System prompt (with a fresh state summary) plus the tail of the history."""
-        system = build_system_prompt(self.state.summary_text(self.settings.max_state_summary_chars))
-        window = self.messages[-self.settings.context_window_messages :]
-        return [{"role": "system", "content": system}, *window]
+        system = build_system_prompt(
+            self.state.summary_text(self.settings.max_state_summary_chars)
+        )
+        return window(self.messages, system, self.settings.context_window_messages)
 
     def _trim_context(self) -> None:
         """Keep the in-process history bounded; the full transcript stays in the log."""
-        keep = self.settings.context_window_messages * 3
-        if len(self.messages) > keep:
-            head = self.messages[:2]  # the first user turn is useful context
-            self.messages = head + self.messages[-(keep - len(head)) :]
+        self.messages = trim(
+            self.messages, self.settings.context_window_messages * 3, head=2
+        )
 
     def _truncate(self, text: str) -> str:
-        limit = self.settings.max_tool_output_chars
-        if len(text) <= limit:
-            return text
-        head = int(limit * 0.6)
-        tail = limit - head
-        return (
-            text[:head]
-            + f"\n\n[... {len(text) - limit} characters truncated from the middle. "
-            f"The full output is in the event log. ...]\n\n"
-            + text[-tail:]
-        )
+        return truncate(text, self.settings.max_tool_output_chars)
 
     def _add_usage(self, usage: dict[str, int]) -> None:
         for key in self.usage_total:
@@ -416,13 +351,18 @@ class Agent:
         return self.logger.emit(type_, redact_data(data, self.settings.secrets))
 
     async def _push(self, queue: asyncio.Queue, event: Event) -> None:
-        await queue.put(event)
+        """Hand an event to the consumer, then give the loop a turn.
 
+        ``Queue.put`` on an unbounded queue never suspends, so a turn made only
+        of fast tools would run to the step budget without the UI ever getting
+        a slot -- and the stop button would have nothing to interrupt.
+        """
+        await self._push_event(event)
+        del queue  # the current turn's queue is tracked on the instance
 
-def _jsonable(value: Any) -> Any:
-    """Best-effort conversion of tool payloads to something json.dumps accepts."""
-    try:
-        json.dumps(value, default=str)
-        return value
-    except (TypeError, ValueError):
-        return json.loads(json.dumps(value, default=str))
+    async def _push_event(self, event: Event) -> None:
+        """Put an event on the running turn's queue, if a turn is in flight."""
+        if self._queue is None:
+            return
+        await self._queue.put(event)
+        await asyncio.sleep(0)

@@ -259,14 +259,14 @@ def test_event_logger_sequences_and_writes(tmp_path: Path) -> None:
     assert json.loads(lines[0])["type"] == "user_message"
 
 
-def test_assistant_deltas_are_not_written_to_disk(tmp_path: Path) -> None:
+def test_assistant_deltas_are_neither_written_nor_buffered(tmp_path: Path) -> None:
     logger = EventLogger("s1", tmp_path / "events.jsonl")
     for _ in range(50):
         logger.emit("assistant_delta", {"text": "tok"})
     logger.emit("assistant_message", {"text": "full"})
     lines = (tmp_path / "events.jsonl").read_text(encoding="utf-8").strip().split("\n")
     assert len(lines) == 1
-    assert len(logger.events) == 51  # but they are all still available in memory
+    assert len(logger.events) == 1  # deltas are not retained either
 
 def test_event_logger_redacts_secrets(tmp_path: Path) -> None:
     logger = EventLogger("s1", tmp_path / "events.jsonl", secrets=("sk-abcdefgh12345678",))
