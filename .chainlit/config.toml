@@ -1,0 +1,34 @@
+# DataLab Agent — Chainlit configuration.
+# MCP stays OFF: we execute LLM-generated code in this process and do not
+# expose any tool-injection surface. See NOTES.md ("Chainlit safety").
+
+[features]
+    latex = true
+    edit_message = true
+    user_message_autoscroll = true
+
+[features.spontaneous_file_upload]
+    enabled = true
+    accept = ["*/*"]
+    max_files = 20
+    max_size_mb = 512
+
+[features.mcp]
+    enabled = false
+
+    [features.mcp.user_servers]
+        enabled = false
+        allowed_urls = []
+
+[UI]
+    name = "DataLab"
+    default_theme = "dark"
+    show_readme_as_default = false
+    show_sidebar = false
+    default_sidebar_state = "closed"
+    cot = "tool_call"
+    layout = "wide"
+
+[meta]
+    generated_by = "2.12.0"
+    description = "Chat-based ML co-pilot: upload a dataset, plan experiments, train and compare models."
