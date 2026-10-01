@@ -289,8 +289,14 @@ async def _render_results(agent: Agent) -> None:
         return
     if table is None or len(table) == 0:
         return
-    await cl.Dataframe(
-        data=table, name="Results (from state.json)", display="inline", size="medium"
+    # Elements cannot be sent on their own in chainlit 2.12 (send needs a
+    # parent); attach the table to a message instead.
+    await cl.Message(
+        content="Results (from state.json):",
+        elements=[
+            cl.Dataframe(data=table, name="results", display="inline", size="medium")
+        ],
+        author="DataLab",
     ).send()
 
 
