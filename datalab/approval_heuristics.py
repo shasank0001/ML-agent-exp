@@ -84,9 +84,7 @@ HEAVY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r"\bdeepcopy\s*\(.*cross_val", "deep cross-validation"),
 )
 
-#: Attribute access that is destructive however it is spelled.
-_METHOD_EVIDENCE = (".unlink(", ".rmdir(")
-
+#: String literals worth re-reading for destructive paths.
 _STRING_LITERAL = re.compile(r"""["']([^"'\n]{1,300})["']""")
 _DATA_SUFFIXES = (".csv", ".tsv", ".parquet", ".xlsx", ".xls", ".feather", ".h5", ".pkl", ".json")
 
@@ -100,7 +98,7 @@ _DESTRUCTIVE_CALLS = frozenset(
     {
         "os.remove", "os.unlink", "os.rmdir", "os.removedirs", "os.rename", "os.replace",
         "os.renames", "os.mkdir", "os.makedirs", "os.chmod", "os.chown", "os.truncate",
-        "os._exit", "os.system", "os.popen", "os.removeprefix",
+        "os._exit", "os.system", "os.popen",
         "shutil.rmtree", "shutil.move",
         "subprocess.run", "subprocess.call", "subprocess.Popen", "subprocess.check_output",
         "subprocess.check_call", "subprocess.getoutput", "subprocess.getstatusoutput",
@@ -364,7 +362,7 @@ def _ast_write_issues(
             chained = any(f".{m}(" in tail for m in _HANDLE_METHODS)
             if not window and not chained:
                 issues.append("it calls open() without a visible mode, so it may write")
-            elif any(m in {"w", "a", "x", "wb", "ab", "+"} for m in window):
+            elif any(_is_mode_token(m) for m in window):
                 mode_arg = node.args[1] if len(node.args) > 1 else next(
                     (kw.value for kw in node.keywords if kw.arg == "mode"), None
                 )
@@ -377,6 +375,12 @@ def _ast_write_issues(
                                 node.args[0] if node.args else None, session_dir, dataset_paths
                             )
     return issues
+
+
+def _is_mode_token(literal: str) -> bool:
+    """True when a string literal looks like an ``open()`` mode (w, w+b, x, a+, ...)."""
+    mode = literal.strip().lower()
+    return bool(mode) and set(mode) <= set("rawbt+x") and any(c in mode for c in "wax+")
 
 
 def _looks_like_write_mode(literal: str) -> bool:
@@ -397,6 +401,10 @@ def _target_issues(
     anchored = any(token in source for token in SAFE_ROOT_TOKENS)
     out: list[str] = []
     for lit in literals:
+        join_issue = _join_escapes(lit, source) if anchored else None
+        if join_issue:
+            out.append(join_issue)
+            continue
         issue = (
             _suffix_issue(lit, session_dir, dataset_paths)
             if anchored
@@ -464,6 +472,10 @@ def _write_issues_in(
     anchored = any(token in head for token in SAFE_ROOT_TOKENS)
     issues: list[str] = []
     for lit in literals:
+        join_issue = _join_escapes(lit, head) if anchored else None
+        if join_issue:
+            issues.append(join_issue)
+            continue
         issue = (
             _suffix_issue(lit, session_dir, dataset_paths)
             if anchored
@@ -482,6 +494,19 @@ def _suffix_issue(literal: str, session_dir: Path, dataset_paths: list[Path]) ->
         return f"it writes to the uploaded dataset path `{literal}` (your data may be overwritten)"
     # Joined onto a safe root, the literal behaves as a relative component.
     return _write_issue(literal.lstrip("/\\"), session_dir, dataset_paths)
+
+
+def _join_escapes(literal: str, anchor_text: str) -> str | None:
+    """Absolute components escape ``os.path.join``/``Path()`` (root is discarded).
+
+    String concatenation (``OUTPUT_DIR + '/x.csv'``) keeps the literal as a
+    suffix and stays safe; only join-style anchors discard the safe root.
+    """
+    if not literal or not literal.startswith(("/", "\\")):
+        return None
+    if "os.path.join" in anchor_text or "Path(" in anchor_text:
+        return f"it writes to `{literal}`, which escapes the session folder (join discards the safe root)"
+    return None
 
 
 def _write_issue(literal: str, session_dir: Path, dataset_paths: list[Path]) -> str | None:

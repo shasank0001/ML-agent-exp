@@ -45,7 +45,12 @@ class ApprovalRequest:
 
 
 def needs_approval(
-    call: ToolCall, state: ResearchState, *, session_dir: Path, threshold_seconds: int = 60
+    call: ToolCall,
+    state: ResearchState,
+    *,
+    session_dir: Path,
+    threshold_seconds: int = 180,
+    python_soft_timeout_s: int | None = None,
 ) -> ApprovalRequest | None:
     """Return an :class:`ApprovalRequest` when the user must confirm, else ``None``.
 
@@ -56,7 +61,10 @@ def needs_approval(
     args = call.arguments or {}
     try:
         if call.name == "python":
-            return _needs_approval_python(call, args, state, session_dir, threshold_seconds)
+            return _needs_approval_python(
+                call, args, state, session_dir, threshold_seconds,
+                python_soft_timeout_s=python_soft_timeout_s,
+            )
         if call.name == "write_file":
             return _needs_approval_write_file(call, args, session_dir)
     except Exception:  # noqa: BLE001 - the gate must never break a run
@@ -64,15 +72,32 @@ def needs_approval(
     return None
 
 
-def _estimated_seconds(args: dict[str, Any]) -> int | None:
-    raw = args.get("est_seconds")
-    if isinstance(raw, bool):
+def coerce_est_seconds(raw: Any) -> int | None:
+    """Lenient runtime-estimate parser (accepts 90, 90.5, '90s', '5m', '1.5h')."""
+    if raw is None or isinstance(raw, bool):
         return None
     if isinstance(raw, (int, float)):
-        return int(raw)
-    if isinstance(raw, str) and raw.strip().isdigit():
-        return int(raw.strip())
+        value = int(raw)
+        return value if 0 <= value <= 7200 else None
+    if isinstance(raw, str):
+        import re
+
+        match = re.fullmatch(
+            r"\s*(\d+(?:\.\d+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?\s*",
+            raw,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        amount, unit = float(match.group(1)), (match.group(2) or "s").lower()
+        multiplier = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
+        value = int(amount * multiplier)
+        return value if 0 <= value <= 7200 else None
     return None
+
+
+def _estimated_seconds(args: dict[str, Any]) -> int | None:
+    return coerce_est_seconds((args or {}).get("est_seconds"))
 
 
 def _needs_approval_python(
@@ -81,6 +106,8 @@ def _needs_approval_python(
     state: ResearchState,
     session_dir: Path,
     threshold_seconds: int,
+    *,
+    python_soft_timeout_s: int | None = None,
 ) -> ApprovalRequest | None:
     code = str(args.get("code") or "")
     if not code.strip():
@@ -108,13 +135,17 @@ def _needs_approval_python(
         )
 
     if est is not None and est > threshold_seconds:
+        note = ""
+        if python_soft_timeout_s is not None and est + 180 > python_soft_timeout_s:
+            effective = min(3600, max(python_soft_timeout_s, est + 180))
+            note = f" NOTE: the cell timeout will be ~{effective}s (estimate + headroom)."
         return ApprovalRequest(
             id=call.id,
             tool=call.name,
             title="Long-running cell",
             reason=(
                 f"**{description}** — the agent estimated ~{est}s of runtime "
-                f"(above the {threshold_seconds}s approval threshold). Approve?"
+                f"(above the {threshold_seconds}s approval threshold). Approve?{note}"
             ),
             code=code,
             details={"est_seconds": est, "threshold": threshold_seconds},

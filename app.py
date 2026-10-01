@@ -18,10 +18,11 @@ from datalab.approvals import ApprovalRequest
 from datalab.config import Settings, load_settings
 from datalab.llm import LLMClient, SelfTestResult
 
-APPROVAL_TIMEOUT_S = 900
+APPROVAL_TIMEOUT_S = 1800
 ASK_USER_TIMEOUT_S = 1_800
 SELF_TEST_TIMEOUT_S = 30
 PREVIEW_CHARS = 60
+MAX_STEP_IMAGES = 8
 
 #: The agent's to-do statuses mapped onto Chainlit's TaskStatus enum.
 TODO_STATUS = {
@@ -138,6 +139,10 @@ async def on_message(message: cl.Message) -> None:
     text = (message.content or "").strip()
     text = f"{text}\n\n" + "\n".join(notes) if (text and notes) else (text or "\n".join(notes))
     if not text:
+        await cl.Message(
+            content="I didn't get any text or file — upload a CSV or type a question.",
+            author="DataLab",
+        ).send()
         return
 
     await _render_events(agent, text)
@@ -147,7 +152,7 @@ async def _render_events(agent: Agent, text: str) -> None:
     """Drive the agent and render every event it produces."""
     stream: cl.Message | None = None
     steps: dict[str, cl.Step] = {}
-    experiments_before = len(agent.state.experiments)
+    results_before = _results_signature(agent)
 
     try:
         async for event in agent.run(text):
@@ -164,14 +169,22 @@ async def _render_events(agent: Agent, text: str) -> None:
                     stream = cl.Message(content=str(data.get("text", "")), author="DataLab")
                     await stream.send()
                 else:
+                    stream.content = str(data.get("text", "") or stream.content)
                     await stream.update()
                 stream = None
 
             elif kind == "tool_start":
-                steps[str(data.get("id"))] = await _open_step(data)
+                call_id = data.get("id")
+                if call_id is None:
+                    continue
+                steps[str(call_id)] = await _open_step(data, agent)
 
             elif kind == "tool_result":
-                await _close_step(steps.pop(str(data.get("id")), None), data)
+                call_id = data.get("id")
+                await _close_step(
+                    steps.pop(str(call_id), None) if call_id is not None else None,
+                    data, agent,
+                )
 
             elif kind == "approval_response":
                 if not data.get("approved"):
@@ -190,24 +203,40 @@ async def _render_events(agent: Agent, text: str) -> None:
 
     except asyncio.CancelledError:
         await cl.ErrorMessage(content="Run cancelled.").send()
+        raise
     finally:
         if stream is not None:
-            await stream.update()
+            try:
+                await stream.update()
+            except Exception:  # noqa: BLE001 - render must not mask cancellation
+                pass
 
-    if len(agent.state.experiments) > experiments_before:
+    if _results_signature(agent) != results_before:
         await _render_results(agent)
 
 
+def _results_signature(agent: Agent) -> str:
+    """Fingerprint of the results table (count + names + metrics)."""
+    try:
+        table = agent.lab.results_table()
+    except Exception:  # noqa: BLE001 - signature is best-effort
+        return ""
+    if table is None or len(table) == 0:
+        return "empty"
+    return str(table.to_dict())
+
+
 # -- tool steps ---------------------------------------------------------
-async def _open_step(data: dict[str, Any]) -> cl.Step:
+async def _open_step(data: dict[str, Any], agent=None) -> cl.Step:
     """Create the collapsible step for a tool call and show its input."""
     name = str(data.get("name", "tool"))
     if name == "python":
         est = (data.get("arguments") or {}).get("est_seconds")
+        est_text = f"  (~{int(est)}s)" if isinstance(est, (int, float)) and not isinstance(est, bool) else ""
         description = str(data.get("description") or "Run Python")
-        title = f"python · {description}" + (f"  (~{est}s)" if est else "")
+        title = f"python · {description}" + est_text
         step = cl.Step(name=title, type="tool", language="python", show_input="code")
-        step.input = str(data.get("code", ""))
+        step.input = str(data.get("code", ""))[:8000]
     else:
         args = {k: v for k, v in (data.get("arguments") or {}).items() if k != "code"}
         shown = ", ".join(f"{k}={_preview(v)}" for k, v in list(args.items())[:4])
@@ -217,7 +246,7 @@ async def _open_step(data: dict[str, Any]) -> cl.Step:
     return step
 
 
-async def _close_step(step: cl.Step | None, data: dict[str, Any]) -> None:
+async def _close_step(step: cl.Step | None, data: dict[str, Any], agent=None) -> None:
     """Fill a tool step with its output, figures and error state."""
     if step is None:  # e.g. a tool the agent never announced
         step = cl.Step(name=str(data.get("name", "tool")), type="tool")
@@ -225,9 +254,25 @@ async def _close_step(step: cl.Step | None, data: dict[str, Any]) -> None:
     step.is_error = bool(data.get("error"))
 
     elements: list[cl.Element] = []
-    for raw in data.get("images") or []:
-        path = Path(str(raw))
-        if path.exists():
+    allowed_roots: list[Path] = []
+    if agent is not None:
+        try:
+            allowed_roots = [
+                agent.paths["figures"].resolve(),
+                agent.paths["outputs"].resolve(),
+            ]
+        except Exception:  # noqa: BLE001 - fall back to no images
+            allowed_roots = []
+    for raw in (data.get("images") or [])[:MAX_STEP_IMAGES]:
+        try:
+            path = Path(str(raw)).resolve()
+        except (OSError, ValueError):
+            continue
+        if not allowed_roots or not any(
+            path == root or path.is_relative_to(root) for root in allowed_roots
+        ):
+            continue
+        if path.exists() and path.is_file() and path.stat().st_size <= 20_000_000:
             elements.append(
                 cl.Image(path=str(path), name=path.name, display="inline", size="small")
             )
@@ -252,7 +297,7 @@ async def _render_results(agent: Agent) -> None:
 async def _publish_plan(agent: Agent, data: dict[str, Any] | None) -> None:
     """Keep a single pinned to-do list in sync with the research state."""
     summary = data or agent.state.summary_dict()
-    plan = summary.get("plan") or []
+    plan = (summary.get("plan") or [])[:20]
     if not plan:
         return
 

@@ -9,9 +9,9 @@
 
 [features.spontaneous_file_upload]
     enabled = true
-    accept = ["*/*"]
-    max_files = 20
-    max_size_mb = 512
+    accept = [".csv", ".tsv", ".parquet", ".xlsx", ".xls"]
+    max_files = 5
+    max_size_mb = 200
 
 [features.mcp]
     enabled = false

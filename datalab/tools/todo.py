@@ -50,17 +50,24 @@ async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     raw_items = args.get("items")
     if not isinstance(raw_items, list):
         return ToolResult.fail("todo needs an 'items' array. Example: {'items': [{'id': '1', 'text': 'Profile the data', 'status': 'done'}]}")
+    if len(raw_items) > 20:
+        return ToolResult.fail("todo takes at most 20 items; split the work into phases.")
     cleaned: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
     for i, item in enumerate(raw_items, start=1):
         if not isinstance(item, dict):
             return ToolResult.fail(f"todo item #{i} is not an object: {item!r}")
-        text = str(item.get("text", "")).strip()
+        text = str(item.get("text", "")).strip()[:200]
         if not text:
             continue
         status = str(item.get("status", "pending")).strip().lower()
         if status not in {"pending", "in_progress", "done"}:
             status = "pending"
-        cleaned.append({"id": str(item.get("id") or i).strip(), "text": text, "status": status})
+        item_id = str(item.get("id") or i).strip()[:20]
+        if item_id in seen_ids:
+            return ToolResult.fail(f"todo has a duplicate id {item_id!r}; ids must be unique.")
+        seen_ids.add(item_id)
+        cleaned.append({"id": item_id, "text": text, "status": status})
     if not cleaned:
         return ToolResult.fail("todo items were empty; pass at least one {'id', 'text', 'status'} item.")
     plan = ctx.state.set_plan(cleaned)

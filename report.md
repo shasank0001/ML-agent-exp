@@ -1,5 +1,13 @@
 # Codebase Review — Must-Do Fixes
 
+> Update (M5 verified + M6 timeout patch, live-probed): the 4 M5 demo fixes are
+> present and correct (lab `force`/`reset_split` + prompt API, evaluate dedupe,
+> SSE retry at both layers, `__import__` sensitive-module rule). This pass
+> applied the ML-timeout patch set below and live-verified with tool-calling
+> self-test OK plus a 200-row golden-path run (profile→split→baseline→2 models,
+> 4 experiments, 0 errors). 274/274 pytest pass. Original findings follow;
+> items marked [FIXED M6] are done in the working tree.
+
 Scope: `app.py`, `datalab/agent.py`, `config.py`, `llm.py`, `events.py`, `state.py`, `lab.py`, `approvals.py` + `approval_heuristics.py`, `prompts.py`, `conversation.py`, `datalab/tools/*`, `.chainlit/config.toml`, `tests/`.
 Tests: 256 passed at review time — fixes below are hardening/correctness, not currently-red tests.
 
@@ -110,3 +118,53 @@ Tests: 256 passed at review time — fixes below are hardening/correctness, not 
 
 33. **Docs/config nits**
     `pyproject.toml:5` uses `NOTES.md` as package readme (should be `README.md`); `chainlit.md` vs `README.md` onboarding drift; `NOTES.md` "Later" list already acknowledges sandbox/concurrency gaps — link each P0 above to that list so demo users see the risk.
+
+---
+
+## Addendum — M6 timeout-for-ML patch (working tree, 274/274 pass + live probe)
+
+Why: the agent is an ML agent; legit training cells take 5-20 min. The old
+defaults (`PYTHON_SOFT_TIMEOUT_S=300`, `APPROVAL_THRESHOLD=60`, `MAX_STEPS=40`,
+`MAX_REPAIRS=3`) killed or nagged every real run, and `est_seconds` was ignored
+by the executor (approve-1200s then kill-at-300s TOCTOU).
+
+Applied:
+- `datalab/config.py`: `MAX_STEPS=60`, `MAX_REPAIRS=5`, `APPROVAL_THRESHOLD=180`,
+  `PYTHON_SOFT_TIMEOUT_S=1200` (+ auto-bump when soft<=threshold),
+  `LLM_TIMEOUT_S=600`/`LLM_MAX_RETRIES=1`, `_float_env`, `_int_env>0` clamp,
+  session_id allowlist `[A-Za-z0-9_-]{1,64}` + traversal guard + `mode=0o700`,
+  redact gate `>=4`.
+- `datalab/tools/python_exec.py`: cell timeout `min(3600, max(base, est+180))`
+  via lenient `_coerce_est_seconds` (s/m/h), `MAX_CODE_CHARS=50k`,
+  `_abandoned` counter in `history_note` + timeout text, `CancelledError`
+  cleanup (streams+cwd), timeout result no longer gets the generic
+  "fix the cause" hint.
+- `datalab/approvals.py`: same lenient est parser (`90s/5m/1.5h`), soft-timeout
+  passthrough with accurate `~est+headroom` note.
+- `datalab/tool_dispatch.py`: `last_timed_out`/`last_elapsed_s`, reset per `run()`,
+  `state.save` guarded (`except Exception` → warning, turn survives).
+- `datalab/agent.py`: timed-out cells reset `repairs` (slow != broken).
+- `datalab/llm.py`: client uses settings timeout/retries; retry gate now blocks
+  on partial tool-call fragments (`text_parts or slots`); retry preserves usage
+  parsing and prefers `with_usage=True` with `stream_options` fallback.
+- `datalab/tools/files.py`: `read_file` total (bad `max_chars`, stat in try,
+  relative display paths), `write_file` deny-list
+  (`state.json`/`events.jsonl`/`*.tmp`/`data/`), `resolve_in_session` returns
+  resolved path (symlink-safe).
+- `datalab/tools/profile.py`: session-contained resolver (outside absolutes rejected).
+- `datalab/tools/ask_user.py`: callback exceptions + non-str answers handled.
+- `datalab/events.py`/`state.py`: redact `>=4`, `root_dir` empty guard.
+- `app.py`: `APPROVAL_TIMEOUT_S=1800`, image containment (`figures/`+`outputs/`,
+  8 max, 20 MB), typed `est` title, missing-id guard, stream-content fix,
+  cancel re-raise + guarded `finally`, empty-message feedback, plan cap 20.
+- `datalab/prompts.py` + `.env.example` + `datalab/lab.py` docstring + `NOTES.md`
+  + `pyproject.toml` (`readme=README.md`): thresholds documented as
+  3-min/est+headroom/1h-cap.
+
+Live probe (OpenRouter tool-calling model): self-test OK; 200-row
+profile→split→baseline→balanced-logreg→RF run completed with 4 experiments,
+0 errors, 1 legit heavy-compute approval (`n_jobs=-1`, est 30s).
+
+Still open (deliberate, see NOTES.md Later): real sandbox/subprocess kill,
+importlib/computed-name approval bypasses, mixed-split table warning,
+timeout-vs-deny distinction in UI callbacks, run-versioned experiment history.

@@ -113,7 +113,7 @@ def safe_history_start(messages: list[dict[str, Any]], wanted: int) -> int:
     while index < len(messages) and orphan_ids(messages, index):
         index += 1
     if index >= len(messages):  # never trim the history to nothing
-        index = max(0, len(messages) - 1)
+        index = len(messages)
     return index
 
 
@@ -128,10 +128,14 @@ def trim(messages: list[dict[str, Any]], keep: int, head: int = 2) -> list[dict[
 
 def truncate(text: str, limit: int = DEFAULT_MAX_TOOL_CHARS) -> str:
     """Shorten long tool output, keeping the head and the tail."""
+    if limit <= 0:
+        return ""
     if len(text) <= limit:
         return text
     head = int(limit * 0.6)
     tail = limit - head
+    if tail <= 0:
+        return text[:limit] + f"\n\n[... {len(text) - limit} characters truncated. ...]\n\n"
     return (
         text[:head]
         + f"\n\n[... {len(text) - limit} characters truncated from the middle. "
@@ -142,4 +146,6 @@ def truncate(text: str, limit: int = DEFAULT_MAX_TOOL_CHARS) -> str:
 
 def window(messages: list[dict[str, Any]], system_prompt: str, size: int) -> list[dict[str, Any]]:
     """System prompt plus the last ``size`` messages."""
+    if size <= 0:
+        return [{"role": "system", "content": system_prompt}]
     return [{"role": "system", "content": system_prompt}, *messages[-size:]]

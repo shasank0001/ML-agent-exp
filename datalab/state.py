@@ -89,6 +89,8 @@ class ResearchState(BaseModel):
     def save(self, path: Path | None = None) -> Path:
         """Write the state to disk. Returns the path written."""
         target = Path(path) if path else self.state_path
+        if not str(self.root_dir).strip() and path is None:
+            raise ValueError("ResearchState.root_dir is empty — refusing to write to CWD")
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_suffix(".json.tmp")
         tmp.write_text(self.model_dump_json(indent=2), encoding="utf-8")
@@ -200,7 +202,10 @@ class ResearchState(BaseModel):
                 f"- Dataset: {Path(ds.path).name} — {ds.n_rows} rows x {ds.n_cols} cols, "
                 f"{ds.duplicates} duplicate rows."
             )
-            missing = [c["name"] for c in ds.columns if c.get("n_missing", 0)]
+            missing = [
+                c.get("name", "?") for c in ds.columns
+                if isinstance(c, dict) and c.get("n_missing", 0)
+            ]
             if missing:
                 lines.append(f"  - Columns with missing values: {', '.join(missing[:12])}")
             if ds.target_candidates:
@@ -245,7 +250,8 @@ class ResearchState(BaseModel):
 
         text = "\n".join(lines)
         if len(text) > max_chars:
-            text = text[: max_chars - 40] + "\n... (state summary truncated)"
+            cut = max(0, max_chars - 40)
+            text = text[:cut] + "\n... (state summary truncated)"
         return text
 
 

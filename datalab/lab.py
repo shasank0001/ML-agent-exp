@@ -8,7 +8,6 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier, DummyRegressor
-from sklearn.exceptions import NotFittedError
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error, r2_score, roc_auc_score
@@ -137,13 +136,24 @@ class LabSession:
     def load(self, path: str | Path) -> pd.DataFrame:
         """Read csv/tsv/parquet/xlsx; relative paths resolve against data_dir."""
         full = Path(path)
-        full = full if full.is_absolute() else self.data_dir / full
-        suffix = full.suffix.lower()
+        if not full.is_absolute():
+            full = self.data_dir / full
+        try:
+            resolved = full.resolve()
+            resolved.relative_to(self.data_dir.resolve())
+        except ValueError:
+            raise ValueError(
+                f"lab.load: path {full} is outside DATA_DIR; "
+                "pass a bare filename or a path under DATA_DIR."
+            ) from None
+        suffix = resolved.suffix.lower()
         if suffix in (".csv", ".tsv", ".tab"):
-            return pd.read_csv(full, sep="\t" if suffix != ".csv" else ",")
-        if suffix in (".parquet", ".pq"): return pd.read_parquet(full)
-        if suffix in (".xlsx", ".xls"): return pd.read_excel(full)
-        raise ValueError(f"lab.load: unsupported extension {full.suffix!r}")
+            return pd.read_csv(resolved, sep="\t" if suffix != ".csv" else ",")
+        if suffix in (".parquet", ".pq"):
+            return pd.read_parquet(resolved)
+        if suffix in (".xlsx", ".xls"):
+            return pd.read_excel(resolved)
+        raise ValueError(f"lab.load: unsupported extension {resolved.suffix!r}")
     def _record_task(self, target: str, task_type: TaskType, primary_metric: str | None = None) -> TaskSpec:
         if task_type not in _TASKS:
             raise ValueError(f"unknown task_type {task_type!r}")
@@ -200,10 +210,10 @@ class LabSession:
               ) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
         """Encode features and create (or reuse) the train/test split for ``target``.
 
-        Re-splitting the same target with different features, ``test_size`` or
-        ``seed`` replaces the cached split automatically. Pass ``force=True``
-        to rebuild it even when nothing changed -- e.g. after cleaning the
-        frame in place.
+        The cached split is reused only when ``target``, ``task_type``, ``seed``
+        and ``test_size`` all match. Edits to the dataframe itself (cleaning,
+        new features, dropped rows) do NOT bust the cache — pass ``force=True``
+        after changing the frame.
         """
         if target not in df.columns:
             raise ValueError(f"lab.split: target {target!r} not in columns")
@@ -280,9 +290,14 @@ class LabSession:
         """Fit (unless already fitted), score on X_test, log an Experiment."""
         task = self._require_split()
         assert self.X_train is not None and self.y_train is not None and self.X_test is not None and self.y_test is not None
+        from sklearn.utils.validation import check_is_fitted
+
         try:
-            model.predict(self.X_train.iloc[:1])  # already fitted: reuse as-is
-        except (NotFittedError, AttributeError):
+            check_is_fitted(model)
+            fitted = True
+        except Exception:  # noqa: BLE001 - not fitted (or no such check): fit below
+            fitted = False
+        if not fitted:
             model.fit(self.X_train, self.y_train)
         y_pred = model.predict(self.X_test)
         try:

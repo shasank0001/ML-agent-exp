@@ -29,6 +29,7 @@ from .base import ToolResult  # noqa: E402
 
 MAX_VALUE_CHARS = 2_000
 MAX_FIGURES_PER_CELL = 8
+_MISSING = object()
 _RESERVED = {
     "__name__",
     "pd",
@@ -113,6 +114,7 @@ class PythonExecutor:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         self.figures_dir.mkdir(parents=True, exist_ok=True)
         self._cell_index = 0
+        self._abandoned = 0
         self.last_result: ToolResult | None = None
         self.namespace: dict[str, Any] = {
             "__name__": "__main__",
@@ -134,10 +136,17 @@ class PythonExecutor:
         )
 
     def history_note(self) -> str:
-        return f"{self._cell_index} cell(s) executed so far in this session."
+        base = f"{self._cell_index} cell(s) executed so far in this session."
+        if self._abandoned:
+            base += (
+                f" {self._abandoned} timed-out cell(s) were abandoned and may still be "
+                "running in the background — restart the session before trusting "
+                "namespace/lab state for final numbers."
+            )
+        return base
 
     # -- execution ------------------------------------------------------
-    async def run(self, code: str, *, timeout_s: int = 300) -> ToolResult:
+    async def run(self, code: str, *, timeout_s: int = 1200) -> ToolResult:
         """Run one cell. Never raises; failures come back as ``ToolResult(error=True)``."""
         self._cell_index += 1
         index = self._cell_index
@@ -151,18 +160,29 @@ class PythonExecutor:
             # A thread cannot be killed in-process, so the cell keeps running.
             # Put the process-wide state the cell owns back now, rather than
             # waiting for a thread that may never finish.
+            self._abandoned += 1
             _restore_streams(out_before, err_before)
             try:
                 os.chdir(cwd_before)
             except OSError:
                 pass
             return ToolResult.fail(
-                f"Cell timed out after {timeout_s}s and was abandoned. The worker thread could "
-                "not be killed, so it may still be running in the background and may still write "
-                "to `lab` state. Use a smaller data sample, fewer models, or split the work into "
-                "smaller cells, then try again.",
-                data={"cell": index, "timed_out": True},
+                f"Cell timed out after {timeout_s}s and was abandoned (abandoned={self._abandoned}). "
+                "The worker thread could not be killed, so it may still be running in the background "
+                "and may still write to `lab` state or figures. Do NOT treat this as broken code: "
+                "use a smaller data sample, fewer models, or split the work into smaller cells, "
+                "then try again. Restart the session before final numbers if timeouts occurred.",
+                data={"cell": index, "timed_out": True, "timeout_s": timeout_s,
+                      "abandoned": self._abandoned},
             )
+        except asyncio.CancelledError:
+            self._abandoned += 1
+            _restore_streams(out_before, err_before)
+            try:
+                os.chdir(cwd_before)
+            except OSError:
+                pass
+            raise
         except Exception as exc:  # noqa: BLE001 - defensive
             return ToolResult.fail(
                 f"Executor error: {type(exc).__name__}: {exc}", data={"cell": index}
@@ -182,6 +202,7 @@ class PythonExecutor:
         # NOTE: chdir, redirect_stdout and redirect_stderr are all process-global.
         # Acceptable for a single-user local demo; not safe for concurrent sessions.
         # See NOTES.md.
+        reserved_before = {k: self.namespace.get(k, _MISSING) for k in _RESERVED}
         try:
             os.chdir(self.session_dir)
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -195,6 +216,11 @@ class PythonExecutor:
                     failed = True
                     tb = traceback.format_exc(limit=12)
         finally:
+            for key, val in reserved_before.items():
+                if val is _MISSING:
+                    self.namespace.pop(key, None)
+                else:
+                    self.namespace[key] = val
             _restore_streams(previous_out, previous_err)
             try:
                 os.chdir(previous_cwd)
@@ -265,6 +291,7 @@ def _restore_streams(previous_out: Any = None, previous_err: Any = None) -> None
 
 
 # -- the `python` tool --------------------------------------------------
+MAX_CODE_CHARS = 50_000
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -276,8 +303,9 @@ SCHEMA: dict[str, Any] = {
         "est_seconds": {
             "type": "integer",
             "description": (
-                "Your honest estimate of the runtime. REQUIRED for anything above ~30 seconds — "
-                "the user is asked to approve slow cells, and the estimate is shown to them."
+                "Your honest estimate of the runtime in seconds. REQUIRED for anything "
+                "above ~3 minutes — the user is asked to approve slow cells, and the "
+                "estimate sets the cell timeout (estimate + 3 min headroom, max 1h)."
             ),
         },
     },
@@ -298,10 +326,23 @@ async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     code = args.get("code")
     if not isinstance(code, str) or not code.strip():
         return ToolResult.fail("python needs a non-empty 'code' string.")
+    if len(code) > MAX_CODE_CHARS:
+        return ToolResult.fail(
+            f"Code is {len(code):,} characters, over the {MAX_CODE_CHARS:,} limit. "
+            "Split it into smaller cells."
+        )
     if ctx.executor is None:
         return ToolResult.fail("The Python executor is not available in this session.")
-    result = await ctx.executor.run(code, timeout_s=ctx.settings.python_soft_timeout_s)
+    from ..approvals import coerce_est_seconds
+
+    est = coerce_est_seconds(args.get("est_seconds"))
+    base = ctx.settings.python_soft_timeout_s
+    timeout_s = min(3600, max(base, (est or 0) + 180))
+    result = await ctx.executor.run(code, timeout_s=timeout_s)
     result.data.setdefault("description", str(args.get("description") or ""))
+    result.data["timeout_s"] = timeout_s
+    if result.data.get("timed_out"):
+        return result
     if result.error:
         result.text = (
             f"{result.text}\n\n[cell failed — read the traceback above, fix the cause, then rerun a corrected cell]"

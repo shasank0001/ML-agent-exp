@@ -53,6 +53,8 @@ class ToolDispatcher:
         self._record = record_call
         self.request_approval = request_approval
         self.calls_run = 0
+        self.last_timed_out = False
+        self.last_elapsed_s = 0.0
 
     # -- the one entry point ---------------------------------------------
     async def run(self, call: ToolCall) -> bool:
@@ -62,6 +64,7 @@ class ToolDispatcher:
         approval dialog was open; the call is answered first so the message
         history stays sendable.
         """
+        self.last_timed_out = False
         spec = REGISTRY.get(call.name)
         if spec is None:
             await self._answer(
@@ -90,6 +93,7 @@ class ToolDispatcher:
                 self.state,
                 session_dir=self.ctx.root,
                 threshold_seconds=self.settings.approval_seconds_threshold,
+                python_soft_timeout_s=self.settings.python_soft_timeout_s,
             )
         except Exception:  # noqa: BLE001 - a broken heuristic must not block the run
             return None
@@ -122,6 +126,7 @@ class ToolDispatcher:
     # -- execution -------------------------------------------------------
     async def _execute(self, handler, call: ToolCall) -> bool:
         self.calls_run += 1
+        self.last_timed_out = False
         await self._push(self._emit("tool_start", tool_start_data(call)))
         started = time.monotonic()
         try:
@@ -134,9 +139,15 @@ class ToolDispatcher:
                 f"{traceback.format_exc(limit=8)}"
             )
         elapsed = time.monotonic() - started
+        self.last_elapsed_s = elapsed
+        data = result.data if isinstance(result.data, dict) else {}
+        self.last_timed_out = bool(data.get("timed_out"))
 
         text = self.settings.redact(truncate(result.text, self.settings.max_tool_output_chars))
-        self.state.save()
+        try:
+            self.state.save()
+        except Exception as exc:  # noqa: BLE001 - disk/value errors must not kill the turn
+            text += f"\n\n[warning: research-state save failed ({exc}); results above are still valid]"
         await self._push(
             self._emit(
                 "tool_result",
@@ -167,6 +178,8 @@ class ToolDispatcher:
                     "text": text,
                     "error": error,
                     "images": [],
+                    "data": {},
+                    "elapsed_s": 0.0,
                 },
             )
         )

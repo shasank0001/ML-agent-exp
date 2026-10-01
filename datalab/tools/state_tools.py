@@ -100,6 +100,7 @@ async def query_state(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             f"Unknown section {section!r}. Valid sections: {', '.join(SECTIONS)}, all."
         )
     state = ctx.state
+    cap = ctx.settings.max_tool_output_chars if ctx.settings else 8_000
     if section == "all":
         body = "\n\n".join(_section_text(state, s) for s in SECTIONS)
         extra = ""
@@ -108,5 +109,11 @@ async def query_state(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 f"\n\nPython namespace variables: {', '.join(ctx.executor.variable_names()) or 'none yet'}\n"
                 f"{ctx.executor.history_note()}"
             )
-        return ToolResult.ok(body + extra, data={"section": section})
-    return ToolResult.ok(_section_text(state, section), data={"section": section})
+        text = body + extra
+        if len(text) > cap:
+            text = text[:cap] + f"\n\n[... query_state/all truncated to {cap} chars]"
+        return ToolResult.ok(text, data={"section": section})
+    text = _section_text(state, section)
+    if len(text) > cap:
+        text = text[:cap] + f"\n\n[... query_state/{section} truncated to {cap} chars]"
+    return ToolResult.ok(text, data={"section": section})

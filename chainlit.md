@@ -1,5 +1,3 @@
-"""Chainlit welcome screen for DataLab Agent."""
-
 # DataLab — your ML co-pilot
 
 Upload a **CSV** (or Excel/Parquet) with a column you want to predict, then just ask for it.

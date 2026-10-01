@@ -74,9 +74,11 @@ complete surface:
   and the state tools. Do not force the modelling pipeline.
 
 ## Costs and etiquette
-- Any cell you expect to take more than ~30 seconds MUST pass `est_seconds` to the
-  `python` tool. Heavy searches and cells above the approval threshold ask the user
+- Any cell you expect to take more than ~3 minutes MUST pass `est_seconds` to the
+  `python` tool (training runs of 5-20 min are normal). Heavy searches and cells above the approval threshold ask the user
   for approval; supply `est_seconds` so the prompt can show a real estimate.
+  The cell timeout is your estimate + 3 min headroom (max 1h), so over-estimate
+  rather than under-estimate.
 - Prefer fast models first, small data samples while exploring, and a small number
   of well-chosen experiments over a large sweep.
 - **Budget your turns.** You have a limited number of LLM turns per message and

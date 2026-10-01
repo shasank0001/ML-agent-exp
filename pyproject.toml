@@ -2,7 +2,7 @@
 name = "datalab-agent"
 version = "0.1.0"
 description = "A chat-based ML co-pilot: upload a dataset, talk to the agent, it profiles, plans, trains and compares models."
-readme = "NOTES.md"
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 

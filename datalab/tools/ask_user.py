@@ -59,8 +59,17 @@ async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             f"Ask the user directly in your reply instead. Question that was pending: {question}"
         )
 
-    answer = await agent.ask_user(question, options)
-    answer = (answer or "").strip()
+    try:
+        answer = await agent.ask_user(question, options)
+    except Exception as exc:  # noqa: BLE001 - a dropped dialog must not raise
+        return ToolResult.ok(
+            f"The user question could not be delivered ({type(exc).__name__}). "
+            "Proceed with a stated assumption, or stop and wait for their next message.",
+            data={"question": question, "answer": ""},
+        )
+    if not isinstance(answer, str):
+        answer = str(answer) if answer is not None else ""
+    answer = answer.strip()
     if not answer:
         return ToolResult.ok(
             "The user did not answer (or dismissed the question). "

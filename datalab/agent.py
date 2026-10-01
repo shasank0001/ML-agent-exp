@@ -106,8 +106,8 @@ class Agent:
             settings=settings,
             emit=self._emit,
             push=self._push_event,
-            append_message=self.messages.append,
-            record_call=self._known_calls.append,
+            append_message=self._append_message,
+            record_call=self._record_call,
             request_approval=self.request_approval,
         )
 
@@ -155,6 +155,8 @@ class Agent:
 
     async def run(self, user_text: str) -> AsyncIterator[Event]:
         """Run one turn: stream, call tools, repeat until the model stops."""
+        if self._task is not None and not self._task.done():
+            raise AgentError("a turn is already running in this session")
         self._cancelled = False
         self._turn_steps = 0
         self._turn_tool_calls = 0
@@ -240,7 +242,14 @@ class Agent:
                         await self._push(queue, self._emit("error", {"message": "Run cancelled."}))
                         return
                     self._turn_tool_calls += 1
-                    repairs = 0 if await self.dispatcher.run(call) else repairs + 1
+                    ok = await self.dispatcher.run(call)
+                    if getattr(self.dispatcher, "last_timed_out", False):
+                        # Slow != broken: a timed-out training cell must not burn
+                        # the repair budget. The timeout text already tells the
+                        # model to split/shrink the work.
+                        repairs = 0
+                    else:
+                        repairs = 0 if ok else repairs + 1
                 if repairs > self.settings.max_repairs:
                     await self._push(
                         queue,
@@ -271,9 +280,8 @@ class Agent:
             )
         except asyncio.CancelledError:
             self._answer_orphans("Cancelled: the run was stopped before this finished.")
-            self._emit("error", {"message": "Run cancelled."})
             try:
-                await self._push(queue, self._emit("error", {"message": "Run cancelled."}))
+                queue.put_nowait(self._emit("error", {"message": "Run cancelled."}))
             except Exception:  # noqa: BLE001 - the queue may already be closed
                 pass
             return
@@ -282,7 +290,10 @@ class Agent:
             self._queue = None
             self._known_calls = []
             self._trim_context()
-            await queue.put(None)
+            try:
+                queue.put_nowait(None)
+            except Exception:  # noqa: BLE001 - consumer already gone
+                pass
 
     async def _stream_step(
         self, queue: asyncio.Queue
@@ -361,6 +372,14 @@ class Agent:
         )
 
     # -- message plumbing -----------------------------------------------
+    def _append_message(self, message: dict[str, Any]) -> None:
+        """Append to the live history (stable across `_trim_context` rebinds)."""
+        self.messages.append(message)
+
+    def _record_call(self, call: ToolCall) -> None:
+        """Track a call on the live list (stable across per-turn rebinds)."""
+        self._known_calls.append(call)
+
     def _tool_message(self, call: ToolCall, text: str) -> dict[str, Any]:
         return tool_message(call, text)
 
@@ -380,9 +399,6 @@ class Agent:
             self.messages, self.settings.context_window_messages * 3, head=2
         )
 
-    def _truncate(self, text: str) -> str:
-        return truncate(text, self.settings.max_tool_output_chars)
-
     def _add_usage(self, usage: dict[str, int]) -> None:
         for key in self.usage_total:
             self.usage_total[key] += int(usage.get(key, 0) or 0)
@@ -397,8 +413,8 @@ class Agent:
         of fast tools would run to the step budget without the UI ever getting
         a slot -- and the stop button would have nothing to interrupt.
         """
-        await self._push_event(event)
-        del queue  # the current turn's queue is tracked on the instance
+        await queue.put(event)
+        await asyncio.sleep(0)
 
     async def _push_event(self, event: Event) -> None:
         """Put an event on the running turn's queue, if a turn is in flight."""

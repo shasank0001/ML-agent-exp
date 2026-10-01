@@ -143,7 +143,7 @@ churn dataset) exposed four things the offline rehearsal could not:
   is the same call the agent makes, so the two cannot disagree.
 - **`_ask_prompt` / `_approval_prompt` swallow UI exceptions and return a safe
   default** (no answer / denied) so a disconnected browser cannot wedge a turn.
-- **`cl.AskUserMessage` / `cl.AskActionMessage` timeouts are 15 and 30 minutes**
+- **`cl.AskUserMessage` / `cl.AskActionMessage` timeouts are 30 and 30 minutes**
   (the Chainlit defaults are 60s, which is far too short for someone reading a
   traceback before answering).
 
@@ -218,15 +218,18 @@ churn dataset) exposed four things the offline rehearsal could not:
 
 ## 4. Open questions
 
-- Should `lab.evaluate` refuse a second call with the same experiment `name`?
-  Currently it allows duplicates, which makes a re-run look like two
-  independent results in the table.
+- `lab.evaluate` replaces a same-named experiment (M5) so re-running baselines
+  rewrites the row instead of duplicating it. History is intentionally not kept;
+  a mixed-split table (new-split rows next to never-re-run rows) has no warning yet.
 - The context window is a fixed last-N-messages. A summarising compaction step
   would survive longer sessions better; the state summary already carries most
   of the durable content, so V1 was left simple.
-- Approval timeouts (30 min) and `MAX_STEPS=40` are demo-tuned. Neither has been
+- Approval timeouts (30 min) and `MAX_STEPS=60` are demo-tuned. Neither has been
   swept. One live run used 9 steps and 46k prompt tokens for the full golden path;
   a careful exploratory run used 25 and 153k. Both fit, but the ceiling is close.
+  Base cell timeout is `PYTHON_SOFT_TIMEOUT_S=1200` (actual = max(base, est+180),
+  cap 3600) since training cells of 5-20 min are normal; timeouts never count
+  toward `MAX_REPAIRS`.
 - `stealth/space-bunny-alpha` occasionally emits a malformed SSE frame through
   OpenRouter. The step retry absorbs it, but a model that fails this way often
   will feel slow. Worth re-checking before a demo.

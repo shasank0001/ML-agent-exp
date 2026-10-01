@@ -250,18 +250,19 @@ def format_report(info: DatasetInfo, *, max_categories: int = 6) -> str:
     return text if len(text) <= 4000 else text[:3940] + "\n... (report truncated)"
 
 
-def _resolve_path(raw: str, data_dir: Path) -> Path:
-    data_dir = Path(data_dir)
-    for opt in (Path(raw), data_dir / raw, data_dir / Path(raw).name):
-        if opt.exists() and opt.is_file():
-            return opt
-    try:
-        present = sorted(p.name for p in data_dir.iterdir() if p.is_file())[:20]
-    except OSError:
-        present = []
-    have = f"Files in data dir ({data_dir}): {', '.join(present)}" \
-        if present else f"Data dir {data_dir} is empty or missing"
-    raise FileNotFoundError(f"File '{raw}' not found. {have}.")
+def _resolve_in_session(raw: str, ctx) -> Path:
+    """Session-contained resolver: absolute paths must live under the session root."""
+    from .files import resolve_in_session
+
+    path = resolve_in_session(ctx, raw, bases=("data", "outputs", "figures", ""))
+    if not path.exists() or not path.is_file():
+        try:
+            present = sorted(p.name for p in ctx.data_dir.iterdir() if p.is_file())[:20]
+        except OSError:
+            present = []
+        have = f"Files in data dir: {', '.join(present)}" if present else "Data dir is empty"
+        raise FileNotFoundError(f"File '{raw}' not found. {have}.")
+    return path
 
 
 async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -269,11 +270,8 @@ async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         raw = str((args or {}).get("path", "")).strip()
         if not raw:
             raise ValueError("Missing required argument 'path'.")
-        info = profile_dataset(_resolve_path(raw, ctx.data_dir))
+        info = profile_dataset(_resolve_in_session(raw, ctx))
         ctx.state.dataset = info
         return ToolResult.ok(format_report(info), data={"profile": info.model_dump()})
     except Exception as exc:  # noqa: BLE001 - handler never raises
         return ToolResult.fail(f"profile_dataset failed: {exc}")
-
-
-SINGLE_DASH = {"name": "profile_dataset", "description": DESCRIPTION, "parameters": SCHEMA, "handler": handler}

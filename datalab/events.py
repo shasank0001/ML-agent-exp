@@ -87,11 +87,12 @@ class EventLogger:
         """
         if event.type in TRANSIENT_EVENT_TYPES:
             return
-        self._buffer.append(event)
         payload = redact_data(event.model_dump(mode="json"), self._secrets)
         line = json.dumps(payload, ensure_ascii=False, default=str)
-        with self._lock, self.path.open("a", encoding="utf-8") as fh:
+        with self.path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+        with self._lock:
+            self._buffer.append(event)
 
     # -- reading --------------------------------------------------------
     @property
@@ -122,8 +123,9 @@ def redact_data(data: Any, secrets: tuple[str, ...]) -> Any:
         return data
     if isinstance(data, str):
         for secret in secrets:
-            if len(secret) >= 8 and secret in data:
-                data = data.replace(secret, "***redacted***")
+            cleaned = (secret or "").strip() if isinstance(secret, str) else ""
+            if len(cleaned) >= 4 and cleaned in data:
+                data = data.replace(cleaned, "***redacted***")
         return data
     if isinstance(data, dict):
         return {k: redact_data(v, secrets) for k, v in data.items()}

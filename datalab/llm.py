@@ -95,8 +95,8 @@ class LLMClient:
             self._client = AsyncOpenAI(
                 base_url=self.settings.base_url,
                 api_key=self.settings.api_key or "not-set",
-                timeout=300.0,
-                max_retries=2,
+                timeout=getattr(self.settings, "llm_timeout_s", 600.0),
+                max_retries=getattr(self.settings, "llm_max_retries", 1),
             )
         return self._client
 
@@ -176,11 +176,26 @@ class LLMClient:
             # A gateway hiccup mid-request (a corrupt SSE frame, a dropped
             # socket) is worth one retry, but only if nothing has been shown
             # to the user yet -- otherwise the retry would duplicate output.
-            if text_parts or not is_transient(exc):
+            # Partial tool-call fragments also block a retry: replaying them
+            # would concatenate stale + fresh argument chunks into garbage.
+            if text_parts or slots or not is_transient(exc):
                 raise _wrap(exc, tools) from exc
             try:
-                stream = await self._create(kwargs, with_usage=False)
+                try:
+                    stream = await self._create(kwargs, with_usage=True)
+                except Exception as exc_inner:
+                    if _is_stream_options_error(exc_inner):
+                        stream = await self._create(kwargs, with_usage=False)
+                    else:
+                        raise
                 async for chunk in stream:
+                    usage_chunk = getattr(chunk, "usage", None)
+                    if usage_chunk is not None:
+                        usage = Usage(
+                            prompt_tokens=getattr(usage_chunk, "prompt_tokens", 0) or 0,
+                            completion_tokens=getattr(usage_chunk, "completion_tokens", 0) or 0,
+                            total_tokens=getattr(usage_chunk, "total_tokens", 0) or 0,
+                        )
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
                         continue
@@ -292,6 +307,8 @@ def is_transient(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
     if any(k in name for k in ("apistatus", "badrequest", "authentication", "permission", "notfound")):
         return False
+    if any(k in name for k in ("ratelimit", "apiconnection", "timeout", "temporar")):
+        return True
     text = str(exc).lower()
     return any(marker in text for marker in _TRANSIENT_MARKERS) or "apierror" in name
 

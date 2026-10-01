@@ -46,9 +46,11 @@ datalab/
   events.py             Event model + JSONL log
   state.py              ResearchState: dataset, task, plan, experiments, findings
   lab.py                ground truth: split, baseline, evaluate, results table
-  approvals.py          the Approve/Deny policy
+  approvals.py          the Approve/Deny policy (+ approval_heuristics.py shapes)
   prompts.py            system prompt
   config.py             env loading, provider selection, session paths
+  conversation.py       history window/trim/repair helpers
+  tool_dispatch.py      per-call approval + execution + events
   tools/                python executor, profiler, files, todo, state tools, ask_user
 runs/<session_id>/      data/ outputs/ figures/ state.json events.jsonl
 tests/                  pytest, incl. a scripted LLM that rehearses the golden path
