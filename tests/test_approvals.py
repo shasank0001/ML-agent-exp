@@ -149,9 +149,12 @@ def test_grid_search_without_estimate_asks(state: ResearchState, session: Path) 
 
 def test_grid_search_with_estimate_uses_the_estimate(state: ResearchState, session: Path) -> None:
     code = "GridSearchCV(model, {'n_estimators':[10,20]}, cv=3)"
-    request = ask(state, session, code, est_seconds=5)
+    # A fast estimate under the threshold trusts the model: no second prompt.
+    assert ask(state, session, code, est_seconds=5) is None
+    # Without any estimate the heavy pattern still asks and nudges est_seconds.
+    request = ask(state, session, code)
     assert request is not None
-    assert "Estimated runtime" in request.reason
+    assert "est_seconds" in request.reason
 
 
 def test_small_random_forest_does_not_ask(state: ResearchState, session: Path) -> None:

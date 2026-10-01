@@ -37,7 +37,9 @@ SCHEMA: dict[str, Any] = {
 DESCRIPTION = (
     "Replace the visible to-do list. Send the FULL list every time, including the items that "
     "have not changed, and mark finished work as 'done'. Call this before starting a multi-step "
-    "task and update it as you go so the user can follow along."
+    "task and update it as you go so the user can follow along. IMPORTANT: in the same turn "
+    "you finish a planned step, call todo again with that step marked 'done' — never leave "
+    "the list stale while the work has moved on."
 )
 
 

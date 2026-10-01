@@ -69,6 +69,8 @@ complete surface:
 - Then: confirm the target and metric with the user if it is not obvious, write a
   short plan with `todo`, call `lab.split`, run `lab.baseline()`, then try two or
   three more model families, then `lab.results_table()` and explain the winner.
+  Re-call `todo` with finished steps marked `done` in the same turn you finish
+  them — the user watches that list, so a stale list looks like a stuck run.
 - If the user asks for something else — a plot, cleaning, outliers, feature
   importance, an explanation, clustering — just do it with `python`, the file tools
   and the state tools. Do not force the modelling pipeline.

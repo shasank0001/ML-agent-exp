@@ -98,6 +98,40 @@ async def on_chat_start() -> None:
         ).send()
 
 
+@cl.on_chat_resume
+async def on_chat_resume(thread: dict[str, Any]) -> None:
+    """Reconnect a reloaded page to its session dir, keeping saved state."""
+    settings: Settings = load_settings()
+    agent = Agent(
+        session_id=cl.context.session.id,
+        settings=settings,
+        llm=LLMClient(settings),
+        request_approval=_approval_prompt,
+        ask_user=_ask_prompt,
+    )
+    cl.user_session.set("agent", agent)
+    cl.user_session.set("tasklist", None)
+    if agent.resumed:
+        n_exp = len(agent.state.experiments)
+        await cl.Message(
+            content=(
+                f"Reconnected to session `{agent.session_id}` "
+                f"({n_exp} experiment(s) in saved state). "
+                "Note: the in-memory train/test split is gone — ask me to "
+                "re-run `lab.split` before training. Send a message to continue."
+            ),
+            author="DataLab",
+        ).send()
+    else:
+        await cl.Message(
+            content=(
+                f"Session `{agent.session_id}` has no saved state yet. "
+                "Upload a CSV and tell me what to predict."
+            ),
+            author="DataLab",
+        ).send()
+
+
 @cl.on_stop
 async def on_stop() -> None:
     """Chainlit's stop button: cancel the in-flight turn."""
@@ -153,6 +187,7 @@ async def _render_events(agent: Agent, text: str) -> None:
     stream: cl.Message | None = None
     steps: dict[str, cl.Step] = {}
     results_before = _results_signature(agent)
+    saw_problem = False
 
     try:
         async for event in agent.run(text):
@@ -191,18 +226,25 @@ async def _render_events(agent: Agent, text: str) -> None:
                     await cl.Message(content="_You denied that action._", author="DataLab").send()
 
             elif kind == "state_update":
-                await _publish_plan(agent, data)
+                try:
+                    await _publish_plan(agent, data)
+                except Exception:  # noqa: BLE001 - plan widget must not kill rendering
+                    pass
 
             elif kind == "warning":
-                await cl.Message(content=data.get("message", "")).send()
+                await cl.Message(content=data.get("message", ""), author="DataLab").send()
 
             elif kind == "error":
-                await cl.ErrorMessage(
-                    content=str(data.get("message", "Something went wrong."))
-                ).send()
+                message = str(data.get("message", "Something went wrong."))
+                if data.get("fatal") is False or data.get("needs_user"):
+                    await cl.Message(content=message, author="DataLab").send()
+                else:
+                    await cl.ErrorMessage(content=message).send()
+                saw_problem = True
 
     except asyncio.CancelledError:
         await cl.ErrorMessage(content="Run cancelled.").send()
+        saw_problem = True
         raise
     finally:
         if stream is not None:
@@ -211,8 +253,18 @@ async def _render_events(agent: Agent, text: str) -> None:
             except Exception:  # noqa: BLE001 - render must not mask cancellation
                 pass
 
-    if _results_signature(agent) != results_before:
+    results_changed = _results_signature(agent) != results_before
+    if results_changed:
         await _render_results(agent)
+    if saw_problem:
+        n_exp = len(agent.state.experiments)
+        await cl.Message(
+            content=(
+                f"Run ended with an interruption ({n_exp} experiment(s) logged). "
+                "Send a message to continue from the saved state."
+            ),
+            author="DataLab",
+        ).send()
 
 
 def _results_signature(agent: Agent) -> str:
@@ -250,6 +302,7 @@ async def _close_step(step: cl.Step | None, data: dict[str, Any], agent=None) ->
     """Fill a tool step with its output, figures and error state."""
     if step is None:  # e.g. a tool the agent never announced
         step = cl.Step(name=str(data.get("name", "tool")), type="tool")
+        await step.send()
     step.output = str(data.get("text", "")) or "_no output_"
     step.is_error = bool(data.get("error"))
 
@@ -285,19 +338,19 @@ async def _render_results(agent: Agent) -> None:
     """Show the harness-owned results table for whatever was logged this turn."""
     try:
         table = agent.lab.results_table()
+        if table is None or len(table) == 0:
+            return
+        # Elements cannot be sent on their own in chainlit 2.12 (send needs a
+        # parent); attach the table to a message instead.
+        await cl.Message(
+            content="Results (from state.json):",
+            elements=[
+                cl.Dataframe(data=table, name="results", display="inline", size="medium")
+            ],
+            author="DataLab",
+        ).send()
     except Exception:  # noqa: BLE001 - never let a render failure kill the turn
         return
-    if table is None or len(table) == 0:
-        return
-    # Elements cannot be sent on their own in chainlit 2.12 (send needs a
-    # parent); attach the table to a message instead.
-    await cl.Message(
-        content="Results (from state.json):",
-        elements=[
-            cl.Dataframe(data=table, name="results", display="inline", size="medium")
-        ],
-        author="DataLab",
-    ).send()
 
 
 async def _publish_plan(agent: Agent, data: dict[str, Any] | None) -> None:
@@ -309,7 +362,12 @@ async def _publish_plan(agent: Agent, data: dict[str, Any] | None) -> None:
 
     tasklist = cl.user_session.get("tasklist")
     if tasklist is None:
-        tasklist = cl.TaskList(name="Plan", tasks=[_to_task(item) for item in plan], status="Plan")
+        done = sum(1 for item in plan if item.get("status") == "done")
+        tasklist = cl.TaskList(
+            name="Plan",
+            tasks=[_to_task(item) for item in plan],
+            status=f"{done}/{len(plan)} done",
+        )
         await tasklist.send()
         cl.user_session.set("tasklist", tasklist)
         return
@@ -329,7 +387,7 @@ async def _publish_plan(agent: Agent, data: dict[str, Any] | None) -> None:
 def _to_task(item: dict[str, Any]) -> cl.Task:
     return cl.Task(
         title=str(item.get("text", "")),
-        status=TODO_STATUS.get(str(item.get("status")), cl.TaskStatus.READY),
+        status=TODO_STATUS.get(str(item.get("status")), cl.TaskStatus.FAILED),
     )
 
 
@@ -339,8 +397,12 @@ def _preview(value: Any, limit: int = PREVIEW_CHARS) -> str:
 
 
 # -- UI callbacks injected into the agent -------------------------------
-async def _approval_prompt(request: ApprovalRequest) -> bool:
-    """Render an Approve / Deny question and wait for the click."""
+async def _approval_prompt(request: ApprovalRequest) -> bool | None:
+    """Render an Approve / Deny question and wait for the click.
+
+    Returns True/False on an explicit click, None when the dialog timed out
+    or the connection dropped (so the agent can tell those apart from a deny).
+    """
     parts = [request.reason]
     if request.code:
         parts.append(f"\n```python\n{request.code}\n```")
@@ -360,9 +422,9 @@ async def _approval_prompt(request: ApprovalRequest) -> bool:
     try:
         response = await message.send()
     except Exception:  # noqa: BLE001 - a dropped connection must not hang the agent
-        return False
+        return None
     if not response:
-        return False
+        return None
     payload = response.get("payload") or {}
     if "approved" in payload:
         return bool(payload["approved"])

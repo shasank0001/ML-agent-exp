@@ -153,6 +153,11 @@ def _needs_approval_python(
 
     heavy = find_heavy_issues(code)
     if heavy:
+        if est is not None and est <= threshold_seconds:
+            # The model gave a fast estimate under the threshold: trust it and
+            # run without asking. (n_jobs=-1 on a small frame is seconds, not
+            # a cluster job.) The estimate stays visible in the step title.
+            return None
         hint = (
             "Ask for this work with a realistic `est_seconds` value on the `python` tool "
             "next time so the estimate can be shown here."

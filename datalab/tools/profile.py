@@ -261,7 +261,10 @@ def _resolve_in_session(raw: str, ctx) -> Path:
         except OSError:
             present = []
         have = f"Files in data dir: {', '.join(present)}" if present else "Data dir is empty"
-        raise FileNotFoundError(f"File '{raw}' not found. {have}.")
+        raise FileNotFoundError(
+            f"File '{raw}' not found. {have}. "
+            "Prefer the bare filename (e.g. 'iris.csv') — never hand-write an absolute path."
+        )
     return path
 
 
@@ -273,5 +276,10 @@ async def handler(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         info = profile_dataset(_resolve_in_session(raw, ctx))
         ctx.state.dataset = info
         return ToolResult.ok(format_report(info), data={"profile": info.model_dump()})
+    except PermissionError as exc:
+        return ToolResult.fail(
+            f"profile_dataset failed: {exc} "
+            "Use the bare filename (e.g. 'iris.csv') — never hand-write an absolute path."
+        )
     except Exception as exc:  # noqa: BLE001 - handler never raises
         return ToolResult.fail(f"profile_dataset failed: {exc}")

@@ -37,7 +37,7 @@ from .tools.python_exec import PythonExecutor
 #: How many times a step that failed *before* showing any output is re-issued.
 TRANSIENT_STEP_RETRIES = 2
 
-ApprovalFn = Callable[[ApprovalRequest], Awaitable[bool]]
+ApprovalFn = Callable[[ApprovalRequest], Awaitable[bool | None]]
 AskUserFn = Callable[[str, list[str]], Awaitable[str]]
 
 
@@ -66,7 +66,18 @@ class Agent:
 
         self.paths = ensure_session_dirs(settings.runs_dir, session_id)
         self.logger = EventLogger(session_id, self.paths["events"], secrets=settings.secrets)
-        self.state = ResearchState(session_id=session_id, root_dir=str(self.paths["root"]))
+        self.resumed = False
+        if self.paths["state"].exists():
+            try:
+                loaded = ResearchState.load(self.paths["state"])
+                loaded.root_dir = str(self.paths["root"])
+                loaded.session_id = session_id
+                self.state = loaded
+                self.resumed = True
+            except Exception:  # noqa: BLE001 - corrupt state starts fresh, log keeps history
+                self.state = ResearchState(session_id=session_id, root_dir=str(self.paths["root"]))
+        else:
+            self.state = ResearchState(session_id=session_id, root_dir=str(self.paths["root"]))
         self.state.save()
 
         self.lab = LabSession(
@@ -346,10 +357,11 @@ class Agent:
                 {
                     "message": (
                         f"The model call was interrupted: {type(last).__name__}: {last}. "
-                        "Everything computed so far is in the research state — send another "
-                        "message and I will pick it up from there."
+                        "Everything computed so far is saved in the research state "
+                        "(see the results table below) — send another message and "
+                        "I will pick it up from there."
                     ),
-                    "fatal": not text_parts,
+                    "fatal": False,
                 },
             ),
         )

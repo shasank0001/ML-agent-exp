@@ -42,7 +42,7 @@ class ToolDispatcher:
         push: PushFn,
         append_message: Callable[[dict[str, Any]], None],
         record_call: Callable[[ToolCall], None],
-        request_approval: Callable[[ApprovalRequest], Awaitable[bool]],
+        request_approval: Callable[[ApprovalRequest], Awaitable[bool | None]],
     ) -> None:
         self.ctx = ctx
         self.state = state
@@ -102,7 +102,7 @@ class ToolDispatcher:
 
         await self._push(self._emit("approval_request", request.to_dict()))
         try:
-            approved = bool(await self.request_approval(request))
+            decision = await self.request_approval(request)
         except asyncio.CancelledError:
             # The stop button was pressed while the dialog was open. Answer the
             # call so the history stays valid, then let the turn end.
@@ -110,11 +110,22 @@ class ToolDispatcher:
                 call, f"Cancelled by the user while waiting for approval of {request.title}."
             )
             raise
-        except Exception:  # noqa: BLE001 - an errored prompt counts as "denied"
-            approved = False
+        except Exception:  # noqa: BLE001 - an errored prompt is neither deny nor timeout
+            decision = None
 
-        await self._push(self._emit("approval_response", {"id": call.id, "approved": approved}))
-        if approved:
+        if decision is None:
+            await self._push(
+                self._emit("approval_response", {"id": call.id, "approved": False, "timed_out": True})
+            )
+            await self._answer(
+                call,
+                f"No answer arrived for ({request.title}) — the approval dialog timed out "
+                "or the connection dropped. This is NOT a denial: you may ask again, "
+                "do something smaller, or wait for the user.",
+            )
+            return True
+        await self._push(self._emit("approval_response", {"id": call.id, "approved": bool(decision)}))
+        if decision:
             return True
         await self._answer(
             call,
