@@ -183,11 +183,35 @@ async def on_message(message: cl.Message) -> None:
 
 
 async def _render_events(agent: Agent, text: str) -> None:
-    """Drive the agent and render every event it produces."""
+    """Drive the agent and render every event it produces.
+
+    Ordering rule: a streamed reply is always closed *before* the next step
+    opens, so the feed stays chronological (an open-then-updated message would
+    otherwise re-render after later steps).
+    """
     stream: cl.Message | None = None
     steps: dict[str, cl.Step] = {}
     results_before = _results_signature(agent)
     saw_problem = False
+
+    async def flush_stream() -> None:
+        nonlocal stream
+        if stream is not None:
+            try:
+                await stream.update()
+            except Exception:  # noqa: BLE001 - render must not mask cancellation
+                pass
+            stream = None
+
+    async def close_open_steps(note: str) -> None:
+        for step in steps.values():
+            try:
+                step.is_error = True
+                step.output = (step.output or "") + f"\n_{note}_"
+                await step.update()
+            except Exception:  # noqa: BLE001 - best effort on teardown
+                pass
+        steps.clear()
 
     try:
         async for event in agent.run(text):
@@ -212,29 +236,63 @@ async def _render_events(agent: Agent, text: str) -> None:
                 call_id = data.get("id")
                 if call_id is None:
                     continue
+                await flush_stream()
+                old = steps.pop(str(call_id), None)
+                if old is not None:
+                    await _close_step(old, {"text": "_superseded by a repeated call_", "error": True}, agent)
                 steps[str(call_id)] = await _open_step(data, agent)
 
             elif kind == "tool_result":
                 call_id = data.get("id")
-                await _close_step(
-                    steps.pop(str(call_id), None) if call_id is not None else None,
-                    data, agent,
-                )
+                if call_id is None:
+                    continue
+                step = steps.pop(str(call_id), None)
+                if step is None:
+                    await cl.Message(
+                        content=f"_Unannounced tool `{data.get('name', 'tool')}` finished._",
+                        author="DataLab",
+                    ).send()
+                    continue
+                try:
+                    await _close_step(step, data, agent)
+                except Exception:  # noqa: BLE001 - a failed render still shows text
+                    await cl.Message(
+                        content=str(data.get("text", "")) or "_no output_",
+                        author="DataLab",
+                    ).send()
+
+            elif kind == "approval_request":
+                await flush_stream()
+                pending = next(iter(steps.values()), None)
+                if pending is not None:
+                    try:
+                        pending.output = (pending.output or "") + "\n_Waiting for approval…_"
+                        await pending.update()
+                    except Exception:  # noqa: BLE001 - cosmetic only
+                        pass
 
             elif kind == "approval_response":
                 if not data.get("approved"):
-                    await cl.Message(content="_You denied that action._", author="DataLab").send()
+                    if data.get("timed_out"):
+                        await cl.Message(
+                            content="_Approval timed out — not a denial. The agent may ask again._",
+                            author="DataLab",
+                        ).send()
+                    else:
+                        await cl.Message(content="_You denied that action._", author="DataLab").send()
 
             elif kind == "state_update":
                 try:
                     await _publish_plan(agent, data)
-                except Exception:  # noqa: BLE001 - plan widget must not kill rendering
-                    pass
+                except Exception as exc:  # noqa: BLE001 - plan widget must not kill rendering
+                    print(f"[datalab] plan widget update failed: {exc!r}")
 
             elif kind == "warning":
+                await flush_stream()
                 await cl.Message(content=data.get("message", ""), author="DataLab").send()
 
             elif kind == "error":
+                await flush_stream()
                 message = str(data.get("message", "Something went wrong."))
                 if data.get("fatal") is False or data.get("needs_user"):
                     await cl.Message(content=message, author="DataLab").send()
@@ -243,19 +301,15 @@ async def _render_events(agent: Agent, text: str) -> None:
                 saw_problem = True
 
     except asyncio.CancelledError:
+        await flush_stream()
+        await close_open_steps("cancelled")
         await cl.ErrorMessage(content="Run cancelled.").send()
         saw_problem = True
         raise
     finally:
-        if stream is not None:
-            try:
-                await stream.update()
-            except Exception:  # noqa: BLE001 - render must not mask cancellation
-                pass
+        await flush_stream()
 
     results_changed = _results_signature(agent) != results_before
-    if results_changed:
-        await _render_results(agent)
     if saw_problem:
         n_exp = len(agent.state.experiments)
         await cl.Message(
@@ -265,17 +319,20 @@ async def _render_events(agent: Agent, text: str) -> None:
             ),
             author="DataLab",
         ).send()
+    if results_changed:
+        await _render_results(agent)
 
 
 def _results_signature(agent: Agent) -> str:
-    """Fingerprint of the results table (count + names + metrics)."""
+    """Fingerprint of the results table (None when unavailable)."""
     try:
         table = agent.lab.results_table()
     except Exception:  # noqa: BLE001 - signature is best-effort
-        return ""
+        return "unavailable"
     if table is None or len(table) == 0:
         return "empty"
-    return str(table.to_dict())
+    names = [str(n) for n in table["name"].tolist()] if "name" in table.columns else []
+    return f"{len(table)}:{','.join(names)}"
 
 
 # -- tool steps ---------------------------------------------------------
@@ -357,7 +414,17 @@ async def _publish_plan(agent: Agent, data: dict[str, Any] | None) -> None:
     """Keep a single pinned to-do list in sync with the research state."""
     summary = data or agent.state.summary_dict()
     plan = (summary.get("plan") or [])[:20]
+    tasklist = cl.user_session.get("tasklist")
     if not plan:
+        if tasklist is not None:
+            try:
+                tasklist.tasks = []
+                tasklist.status = "0/0"
+                tasklist.name = "Plan — cleared"
+                await tasklist.update()
+            except Exception:  # noqa: BLE001 - cosmetic only
+                pass
+            cl.user_session.set("tasklist", None)
         return
 
     tasklist = cl.user_session.get("tasklist")
